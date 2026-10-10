@@ -1,5 +1,6 @@
 """Unit of Work поверх ``AsyncSession``: три репозитория на одной сессии и одна транзакция."""
 
+import logging
 import socket
 from types import TracebackType
 from typing import Self
@@ -11,6 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from orders_service.application import errors, interfaces
 
 from . import repositories
+
+logger = logging.getLogger(__name__)
 
 # Сбой сериализации, взаимная блокировка, отказ сервера принять соединение (лимит
 # соединений, остановка или перезапуск): транзакцию можно повторить.
@@ -129,5 +132,10 @@ class UnitOfWork(interfaces.UnitOfWork):
             raise errors.StorageUnavailable() from exc
 
     async def commit(self) -> None:
-        """Фиксирует транзакцию; ошибка commit уходит в ``__aexit__`` и переводится там."""
+        """Фиксирует транзакцию; ошибка commit уходит в ``__aexit__`` и переводится там.
+
+        Об исходе фиксации знает только адаптер, поэтому DEBUG-запись о ней живёт здесь,
+        а не в сервисах; с запросом её связывает ``request_id`` записи.
+        """
         await self._session.commit()
+        logger.debug("Транзакция зафиксирована")

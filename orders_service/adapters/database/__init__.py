@@ -5,7 +5,7 @@
 """
 
 from . import repositories
-from .database import Database
+from .database import Database, logger_levels
 from .mapping import mapper
 from .settings import Settings
 from .tables import metadata
@@ -15,6 +15,7 @@ __all__ = [
     "Database",
     "Settings",
     "UnitOfWork",
+    "logger_levels",
     "mapper",
     "metadata",
     "repositories",

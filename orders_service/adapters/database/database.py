@@ -1,4 +1,4 @@
-"""Движок и фабрика сессий SQLAlchemy."""
+"""Движок и фабрика сессий SQLAlchemy; уровни логгеров SQLAlchemy для конфигурации логирования."""
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -23,17 +23,14 @@ class Database:
         """Создаёт движок и фабрику сессий; соединения открываются лениво.
 
         Пул создаётся с ``pool_pre_ping``: мёртвое простаивающее соединение проверяется
-        до выдачи из пула, а не на первом запросе транзакции.
+        до выдачи из пула, а не на первом запросе транзакции. SQL-лог включается не флагом
+        ``echo`` движка, а уровнем логгера (см. ``logger_levels``).
 
         Args:
             settings: Параметры подключения к PostgreSQL.
         """
         self._settings = settings
-        self._engine: AsyncEngine = create_async_engine(
-            settings.database_url,
-            echo=settings.POSTGRES_ECHO_SQL,
-            pool_pre_ping=True,
-        )
+        self._engine: AsyncEngine = create_async_engine(settings.database_url, pool_pre_ping=True)
         self.session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
             self._engine, expire_on_commit=False
         )
@@ -56,3 +53,19 @@ class Database:
     async def aclose(self) -> None:
         """Закрывает пул соединений при остановке приложения."""
         await self._engine.dispose()
+
+
+def logger_levels(settings: Settings) -> dict[str, str]:
+    """Уровни логгеров SQLAlchemy для ``log.configure``.
+
+    SQL пишется логгером ``sqlalchemy.engine`` на уровне INFO. Включать его через ``echo=True``
+    у движка нельзя: ``echo`` вешает на логгер собственный ``StreamHandler``, и при
+    настроенном корневом хендлере каждая строка SQL пишется дважды.
+
+    Args:
+        settings: Параметры подключения; ``POSTGRES_ECHO_SQL`` включает SQL-лог.
+
+    Returns:
+        Имя логгера → уровень.
+    """
+    return {"sqlalchemy.engine": "INFO" if settings.POSTGRES_ECHO_SQL else "WARNING"}

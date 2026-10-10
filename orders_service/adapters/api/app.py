@@ -3,19 +3,24 @@
 from typing import Any
 
 from fastapi import FastAPI
+from starlette.types import ASGIApp
 
 from . import error_handlers
 from .lifespan import Lifespan
+from .request_id import RequestIdMiddleware
 from .v1 import Controller as V1Controller
 from .v1 import create_router as create_v1_router
 
 
-class FastApiWithout422(FastAPI):
-    """FastAPI с честным контрактом: без автоматического ответа 422.
+class App(FastAPI):
+    """FastAPI с двумя отличиями проекта: без 422 в схеме и с request id снаружи стека.
 
     FastAPI дописывает 422 каждой ручке с валидацией, но ошибки разбора запроса адаптер
     отдаёт как 400 (он уже объявлен в картах ответов роутера), поэтому 422 и его модели
-    из схемы убираются. ``super().openapi()`` кэширует схему, правка в ней сохраняется.
+    из схемы убираются; ``super().openapi()`` кэширует схему, правка в ней сохраняется.
+    ``RequestIdMiddleware`` оборачивает весь стек Starlette, а не добавляется через
+    ``add_middleware``: иначе он оказался бы внутри ``ServerErrorMiddleware``, и ответ 500
+    уходил бы без ``X-Request-ID``.
     """
 
     def openapi(self) -> dict[str, Any]:
@@ -31,6 +36,14 @@ class FastApiWithout422(FastAPI):
         for model in ("HTTPValidationError", "ValidationError"):
             schema.get("components", {}).get("schemas", {}).pop(model, None)
         return schema
+
+    def build_middleware_stack(self) -> ASGIApp:
+        """Собирает стек middleware и оборачивает его корреляцией запросов снаружи.
+
+        Returns:
+            ASGI-приложение: ``RequestIdMiddleware`` поверх стандартного стека.
+        """
+        return RequestIdMiddleware(super().build_middleware_stack())
 
 
 def create_app(
@@ -51,7 +64,7 @@ def create_app(
     Returns:
         Готовое к запуску приложение FastAPI.
     """
-    app = FastApiWithout422(
+    app = App(
         title="Orders Service API",
         version="1.0.0",
         lifespan=lifespan,

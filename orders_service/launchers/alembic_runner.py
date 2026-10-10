@@ -4,13 +4,11 @@ python -m orders_service.launchers.alembic_runner upgrade head
 python -m orders_service.launchers.alembic_runner revision --autogenerate -m "<slug>" --rev-id 0002
 """
 
-import logging
 import sys
 
 from alembic.config import CommandLine, Config
 
-from orders_service.adapters import database
-from orders_service.launchers import config
+from orders_service.adapters import database, log
 
 SCRIPT_LOCATION = "orders_service.adapters.database:alembic"
 VERSION_LOCATIONS = "orders_service.adapters.database:migrations"
@@ -39,12 +37,16 @@ def make_config(settings: database.Settings) -> Config:
 def run_cmd(*args: str) -> None:
     """Выполняет команду Alembic с аргументами командной строки.
 
+    Логирование настраивается так же, как у HTTP-сервиса: логгер ``alembic`` хендлеров не
+    вешает (``env.py`` не вызывает ``fileConfig``) и наследует корневой.
+
     Args:
         *args: Аргументы в формате CLI Alembic, например ``upgrade head``.
     """
-    logging.basicConfig(level=config.Settings().LOG_LEVEL.upper())
+    db_settings = database.Settings()
+    log.configure(log.Settings(), levels=database.logger_levels(db_settings))
     cli = CommandLine(prog="python -m orders_service.launchers.alembic_runner")
-    cli.run_cmd(make_config(database.Settings()), cli.parser.parse_args(args))
+    cli.run_cmd(make_config(db_settings), cli.parser.parse_args(args))
 
 
 if __name__ == "__main__":

@@ -114,8 +114,9 @@ flowchart LR
         CONFIG["config.py"]
     end
     subgraph adapters["adapters"]
-        API["api — FastAPI<br/>create_app · Controller · create_router · error_handlers"]
+        API["api — FastAPI<br/>create_app · Controller · create_router · error_handlers · request_id"]
         DB["database — SQLAlchemy<br/>UnitOfWork · репозитории · tables · mapping · alembic"]
+        LOG["log — конфигурация logging<br/>Settings · make_config · configure · request_id"]
     end
     subgraph application["application — ядро"]
         SERVICES["services<br/>Customer · Product · Order"]
@@ -128,6 +129,9 @@ flowchart LR
     API_L --> DB
     API_L --> SERVICES
     ALEMBIC --> DB
+    API_L --> LOG
+    ALEMBIC --> LOG
+    API -. request_id .-> LOG
     API --> SERVICES
     DB -. реализует .-> INTERFACES
     SERVICES --> INTERFACES
@@ -139,8 +143,9 @@ flowchart LR
 | Слой | Что внутри | Правила |
 |---|---|---|
 | `application/` | `entities.py` — весь домен; `services/` — сервис на сущность с набором методов; `interfaces/` — ABC только для **исходящих** портов; `dtos/` — Pydantic-модели входа/выхода и параметры поиска; `errors.py` | Между слоями передаются DTO и сущности, не `dict`/`list`. Входящих портов нет: контроллер зависит от конкретных `services.X` |
-| `adapters/api/` | `create_app`, `create_lifespan`, `error_handlers`, `v1/controller.py`, `v1/router.py`, `v1/schemas` (`*Body.to_application()`), `v1/dtos` (`*Response.from_application()`) | **Обработчики — методы класса `Controller`, сервисы приходят в его конструктор. FastAPI-`Depends` не используется нигде.** `Path/Query/Body` — разбор запроса, не DI. Маршруты объявляются императивно (`add_api_route`) |
+| `adapters/api/` | `create_app`, `create_lifespan`, `error_handlers`, `request_id` (middleware корреляции), `v1/controller.py`, `v1/router.py`, `v1/schemas` (`*Body.to_application()`), `v1/dtos` (`*Response.from_application()`) | **Обработчики — методы класса `Controller`, сервисы приходят в его конструктор. FastAPI-`Depends` не используется нигде.** `Path/Query/Body` — разбор запроса, не DI. Маршруты объявляются императивно (`add_api_route`) |
 | `adapters/database/` | `settings`, `database` (движок и фабрика сессий), `tables`, `mapping` (императивный маппинг dataclass-сущностей), `repositories/`, `unit_of_work`, `alembic/`, `migrations/` | Реализации портов носят имена портов и различаются модулем: `interfaces.OrdersRepo` / `database.repositories.OrdersRepo` |
+| `adapters/log/` | `settings` (`LOG_LEVEL`, `LOG_FORMAT`), `config` (`make_config`, `configure`), `context` (`request_id`, `RequestIdFilter`) | Инфраструктура без порта: любой слой пишет через `logging.getLogger(__name__)`, хендлеры и формат задаются здесь, применяет composition root; другие адаптеры могут импортировать `log` как библиотеку, обратных зависимостей нет |
 | `launchers/` | `api.py` — composition root HTTP-сервиса; `alembic_runner.py` — миграции; `config.py` — настройки уровня приложения | Граф собирается вручную в классах-неймспейсах при импорте модуля; все адаптеры и сервисы — синглтоны процесса |
 
 ---
@@ -204,6 +209,37 @@ sequenceDiagram
   блокирует только товары, `cancel` — строку заказа, затем товары; цикла нет. Проверено
   интеграционными тестами: детерминированная гонка за последнюю единицу, актуальность под
   блокировкой, захват двух строк в противоположном порядке → дедлок → 503.
+
+---
+
+## Логирование
+
+- **Где настраивается.** `adapters/log` — конфигурация `logging`, не адаптер порта: любой слой
+  пишет через `logging.getLogger(__name__)` и не знает о хендлерах. `log.Settings`
+  (`LOG_LEVEL`, `LOG_FORMAT=text|json`) и `make_config` задают один хендлер в stdout, а
+  composition root (`launchers/api.py`, `alembic_runner.py`) вызывает `log.configure`.
+- **Чужие логгеры — в общий хендлер.** `database.logger_levels(settings)` даёт уровень
+  `sqlalchemy.engine` (INFO при `POSTGRES_ECHO_SQL`, иначе WARNING) — вместо `echo=True`
+  движка, который вешает собственный хендлер и дублирует строки. Имена логгеров uvicorn живут
+  в launcher (`UVICORN_LOGGERS`, уровень `NOTSET` — наследовать `LOG_LEVEL`): `LOG_LEVEL=WARNING`
+  глушит access-лог. Ранее созданные логгеры не отключаются (`disable_existing_loggers=False`).
+- **Корреляция запросов.** `RequestIdMiddleware` (`adapters/api/request_id.py`) принимает
+  `X-Request-ID` (`[A-Za-z0-9._-]{1,64}`) или генерирует uuid4, ставит contextvar
+  `log.request_id` на время запроса и возвращает заголовок в ответе; `RequestIdFilter` на
+  хендлере дописывает `request_id` в каждую запись, включая `uvicorn.access` и SQL. Middleware
+  стоит снаружи всего стека (`App.build_middleware_stack`), поэтому заголовок есть и у 500.
+  Ограничение: трассировку необработанного исключения uvicorn пишет после выхода из
+  приложения — без id, рядом со строкой access-лога, где id есть.
+- **Что логирует ядро.** Ничего: сервис не знает об исходе фиксации. `database.UnitOfWork.commit`
+  пишет DEBUG «Транзакция зафиксирована», обработчик ошибок — WARNING на 503 и ничего на
+  4xx/500 (трассировку 500 пишет сервер).
+- **Формат.** `text`: `2026-10-10 12:00:00 INFO     [orders_service…] [<request_id>] …`;
+  `json` (python-json-logger): объект на строку с `asctime`, `levelname`, `name`, `message`,
+  `request_id`. Две-три строки master-процесса uvicorn остаются в его формате; `--log-level`
+  в entrypoint влияет только на них.
+- `logging` сам построен на Observer (хендлеры), Strategy (форматтер) и Chain of Responsibility
+  (иерархия логгеров, фильтры); адаптер их только конфигурирует, в таблицу паттернов они не
+  добавлены.
 
 ---
 
@@ -297,7 +333,7 @@ stateDiagram-v2
 | ошибка разбора запроса (`code: validation_error`, `context.details[]` с `loc/msg/type`) | 400 |
 | ошибка ядра без категории, любое необработанное исключение | 500 (текст без подробностей) |
 
-Автоматический ответ 422 FastAPI из схемы убран (`FastApiWithout422.openapi`): валидация
+Автоматический ответ 422 FastAPI из схемы убран (`App.openapi`): валидация
 отдаёт 400. Ограничения тел запросов (`*Body`) — те же типы, что у DTO ядра
 (`application/dtos/base.py`): границы входа совпадают с границами хранилища (`id`, `stock` и
 `offset` — int4, `quantity` ≤ 1 000 000, строк в заказе ≤ 100, `limit` ≤ 200, email только
@@ -339,8 +375,12 @@ ASCII), поэтому вход, который БД не вместит, отк
 | `unit/application/services/` | сервисы на моках портов: фабрика — `Mock(return_value=uow)`, `MagicMock(spec=interfaces.UnitOfWork)` с `Mock(interfaces.XRepo)`, порядок вызовов через `uow.mock_calls` (commit только у записей, новый UoW на вызов); классы по методам (`TestAdd`, `TestGet`, `TestPlace` …), параметризация «что вернул репозиторий → что отдал сервис» | нет |
 | `unit/application/` | сущности (`test_entities.py`: State, Strategy, остатки), DTO (`test_dtos.py`: нормализация и границы) | нет |
 | `unit/adapters/api/v1/` | `test_schemas.py` — граничные входы `*Body` принимаются DTO ядра (общие типы `dtos.base`) | нет |
+| `unit/adapters/api/` | `test_request_id.py` — `RequestIdMiddleware` на ASGI-заглушке: uuid4, валидный и невалидный заголовок, сброс contextvar (и при исключении), passthrough `lifespan` | нет |
+| `unit/adapters/log/` | `test_settings.py` (регистр уровня, отказ `TRACE`), `test_config.py` (уровни → `propagate`-логгеры, выбор форматтера), `test_context.py` (`RequestIdFilter`) | нет |
+| `unit/adapters/database/` | `test_database.py` — `logger_levels` по `POSTGRES_ECHO_SQL` | нет |
+| `integration/adapters/log/` | `test_configure.py` — `configure` в дочернем процессе: text и json, ранний логгер пишет, `uvicorn.access` в нашем формате с `request_id`, WARNING режет SQL | нет |
 | `unit/launchers/` | `test_api.py` — composition root импортируется с подставленными `POSTGRES_*`, `Adapters.uow_factory()` собирает `database.UnitOfWork`, сервисы делят одну фабрику; запросов к БД нет | нет |
-| `integration/adapters/api/controllers/` | настоящий FastAPI над `Mock(services.X)` (`conftest.py`: `<x>_service`, `app`, `client`); модуль на ресурс, класс на обработчик (`TestCreateCustomer`, `TestListOrders` …); `test_error_handlers.py` — 503 с `Retry-After`, 500 без подробностей, единое тело 404/405, контракт OpenAPI | нет |
+| `integration/adapters/api/controllers/` | настоящий FastAPI над `Mock(services.X)` (`conftest.py`: `<x>_service`, `app`, `client`); модуль на ресурс, класс на обработчик (`TestCreateCustomer`, `TestListOrders` …); `test_error_handlers.py` — 503 с `Retry-After`, 500 без подробностей, единое тело 404/405, контракт OpenAPI; `test_request_id.py` — `X-Request-ID` возвращается на 200, 404, 503 и 500 | нет |
 | `integration/adapters/database/` | `conftest.py` — `create_test_db` (схема через `metadata.create_all`, без миграций), `session` (откат после теста), `uow_factory`; `test_data.py` — наборы `*_DATA` и `insert_*`; `repositories/test_*.py` — `fill_db` autouse, класс на метод репозитория (`TestFetchById`, `TestFetchAll`, `TestAdd` …); `test_unit_of_work.py` — транзакции коммитятся по-настоящему: атомарность, откат на второй строке, оплата и отмена, `FOR UPDATE` (гонка, актуальность, повторная блокировка), дедлок и обрыв соединения (в теле и на commit) → `StorageUnavailable`, жизненный цикл UoW (вне контекста непригоден, вложенный вход запрещён, повторный вход — новая сессия) | `TEST_POSTGRES_*` (на dev-стенде — контейнер `db_for_tests`), иначе `skip`; схема пересоздаётся на каждый тест |
 
 Соглашения (как в hex_arch): секции `# SETUP` / `# TESTS` в модуле, фикстуры с явным `scope`
@@ -361,6 +401,7 @@ ASCII), поэтому вход, который БД не вместит, отк
 | Falcon + gunicorn/gevent, sync SQLAlchemy | FastAPI + uvicorn, async SQLAlchemy (asyncpg) | async-стек; HTTP-адаптер по образцу interactive_panels |
 | `TransactionContext` (сессия на поток, счётчик вложенности) + реестр `DecoratedFunctionRegistry.apply_decorators(...)` в launcher | вызываемая фабрика UoW в конструкторе сервиса + явный `async with self.uow_factory() as uow` в методе | thread-local не живёт в asyncio; без глобальной мутации классов; UoW и репозитории создаются на вызов |
 | Репозитории — синглтоны с сессией из контекста | Репозитории создаёт `UnitOfWork.__aenter__` на каждую транзакцию | то же |
+| `adapters/log` + фрагменты `LOGGING_CONFIG` в `Settings` каждого адаптера с привязкой к хендлеру `default` | `adapters/log` + `database.logger_levels` и `UVICORN_LOGGERS` в launcher: только имя логгера → уровень, `propagate` в корень; `request_id` через contextvar и фильтр | без связности по имени хендлера и строителя в Settings; `disable_existing_loggers=False`; имена логгеров — `__name__`; корреляция запросов |
 | `application/schemas` для параметров поиска | `FindOrders` в `dtos/order.py` | слово `schemas` занято HTTP-швом с другим смыслом |
 | Pydantic v1, `validate_arguments` на методах сервисов | Pydantic v2, без `validate_call` | вход валидируется при построении DTO на границе |
 | `ErrorMeta` (метакласс) | `__init_subclass__` + категории ошибок | меньше магии; категории дают OCP в обработчике ошибок |

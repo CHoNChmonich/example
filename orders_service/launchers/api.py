@@ -4,27 +4,37 @@
 (``Settings → Logger → Adapters → Application → Controllers``) — без DI-контейнера
 и без FastAPI-``Depends``. Все адаптеры и сервисы — синглтоны процесса; ошибка конфигурации
 проявляется на старте, а не на первом запросе.
+
+Имена логгеров uvicorn живут здесь, а не в HTTP-адаптере: сервер выбирает launcher.
+Уровень ``NOTSET`` означает «наследовать ``LOG_LEVEL``»; после импорта приложения наш
+``dictConfig`` перехватывает эти логгеры в воркерах, две-три строки master-процесса
+остаются в формате uvicorn.
 """
 
-import logging
 from functools import partial
 
-from orders_service.adapters import api, database
+from orders_service.adapters import api, database, log
 from orders_service.application import entities, services
 from orders_service.launchers import config
 
+UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
+
 
 class Settings:
-    """Настройки процесса: адаптера БД и уровня приложения."""
+    """Настройки процесса: адаптера БД, уровня приложения и логирования."""
 
     db = database.Settings()
     service = config.Settings()
+    logging = log.Settings()
 
 
 class Logger:
-    """Корневой логгер приложения; uvicorn настраивает только свои логгеры."""
+    """Логирование: уровень и формат из настроек; uvicorn и SQLAlchemy — в общий хендлер."""
 
-    logging.basicConfig(level=Settings.service.LOG_LEVEL.upper())
+    log.configure(
+        Settings.logging,
+        levels={**database.logger_levels(Settings.db), **dict.fromkeys(UVICORN_LOGGERS, "NOTSET")},
+    )
 
 
 class Adapters:
@@ -33,7 +43,7 @@ class Adapters:
     ``uow_factory`` — вызываемый объект без аргументов: при каждом вызове сервис получает
     новый ``database.UnitOfWork`` над фабрикой сессий движка; это ``partial``, а не лямбда,
     потому что тело класса недоступно вложенным функциям, а присваивание лямбды запрещено
-    линтером.
+    линтером (E731).
     """
 
     db = database.Database(settings=Settings.db)

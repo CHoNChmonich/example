@@ -1556,6 +1556,53 @@ class Logger:
 (п. 16) — сейчас / техдолг / не трогать; (4) ограничение «трассировка 500 без id» принять как
 есть или не сбрасывать contextvar на пути исключения (вариант A).
 
+### 18.10 Актуализация под новый Unit of Work (2026-10-10)
+
+После раздела 19 (`@transactional` удалён, UoW создаётся вызываемым объектом и сам управляет
+сессией) план 18.9 меняется так:
+
+- **D9''.** DEBUG-запись о фиксации переезжает из обёртки в `database.UnitOfWork.commit()`:
+  «транзакция зафиксирована». Об исходе фиксации знает только адаптер БД, а корреляцию с
+  запросом даёт `request_id` в записи. Сервисы по-прежнему не логируют.
+- **Шаг 5 и тест-план:** вместо `test_transactional.py` — `integration/adapters/database/
+  test_unit_of_work.py`, класс `TestCommit`, тест `test__commit_logged_at_debug` (`caplog` на
+  логгер `orders_service.adapters.database.unit_of_work`, уровень DEBUG, без привязки к полному
+  тексту).
+- **Структура 18.9:** строка `orders_service/application/transactional.py # DEBUG после commit`
+  → `orders_service/adapters/database/unit_of_work.py # DEBUG в commit()`.
+- **Вопросы 18.9 на решение пользователя:** (1) фильтр и contextvar в `adapters/log` — принято;
+  (2) JSON-форматтер остаётся; (3) `__cause__` в WARNING для 503 — в эту задачу не входит, ждёт
+  решения; (4) трассировка uvicorn для 500 без id — принято как ограничение.
+- Остальное (D1–D8, D10, D11, структура, шаги 1–4 и 6–7, тест-план) — без изменений.
+
+### 18.11 Реализация и проверка (2026-10-10)
+
+Реализовано по 18.9 с поправками 18.10. Отличие от плана одно: JSON-форматтер объявлен через
+фабрику `"()"` с `json_ensure_ascii=False` — иначе python-json-logger экранирует кириллицу
+(`"Тр..."`), и сырой лог нечитаем; на стенде это проявилось как «пропавшая» строка
+«Транзакция зафиксирована». Зависимость `python-json-logger>=4.2.0` добавлена в `pyproject.toml`.
+
+**Состав:** `adapters/log/{settings,config,context}.py`; `adapters/api/request_id.py` и `App`
+(бывший `FastApiWithout422`) с `build_middleware_stack`; `database.logger_levels` и движок без
+`echo`; DEBUG в `UnitOfWork.commit`; `launchers/api.py` (`UVICORN_LOGGERS`, `Settings.logging`,
+`Logger` через `configure`), `alembic_runner.py`, `launchers/config.py` без `LOG_LEVEL`;
+`.env.example`/`.env` — блок «Логирование»; README (раздел «Логирование», диаграмма, таблицы
+слоёв, тестов и отличий), CLAUDE.md.
+
+**Тесты (34 новых, всего 187):** `unit/adapters/log/` (settings, make_config, фильтр),
+`integration/adapters/log/test_configure.py` (дочерний процесс: text/json, ранний логгер,
+`uvicorn.access` с id, WARNING режет SQL, кириллица не экранирована, ровно две строки),
+`unit/adapters/api/test_request_id.py` (ASGI-заглушка), `integration/.../test_request_id.py`
+(заголовок на 200/404/503/500), `unit/adapters/database/test_database.py` (`logger_levels`),
+`TestCommit` в `test_unit_of_work.py`.
+
+**Стенд (dev, `LOG_FORMAT=json`, `LOG_LEVEL=DEBUG`, `POSTGRES_ECHO_SQL=true`):** `X-Request-ID`
+возвращается на 201 напрямую и на 404 через nginx, недопустимое значение заменено uuid4; все
+строки одного запроса (SQL, DEBUG о фиксации, `uvicorn.access`) несут один `request_id`;
+`INSERT INTO customers` в логе один раз (без дублей от `echo`); миграции Alembic пишут в тот же
+JSON; вне JSON — только две строки master-процесса uvicorn. `LOG_LEVEL=WARNING` + `text`:
+access-лог и INFO молчат. ruff, mypy, pytest — зелёные; стенд после проверки снесён.
+
 ---
 
 ## 19. Переделка Unit of Work: без класса-фабрики и без `@transactional` (2026-10-10)

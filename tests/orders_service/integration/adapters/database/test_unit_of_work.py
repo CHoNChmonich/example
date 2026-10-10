@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import logging
 from decimal import Decimal
 
 import pytest
@@ -20,6 +21,7 @@ from . import test_data
 # SETUP
 # ---------------------------------------------------------------------------------------
 WAIT_TIMEOUT = 15  # секунд; защищает прогон от зависания, если участник гонки упадёт
+UOW_LOGGER = "orders_service.adapters.database.unit_of_work"
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -372,3 +374,24 @@ class TestLifecycle:
         assert first is not None
         assert second is not None
         assert first is not second
+
+
+class TestCommit:
+    async def test__commit_logged_at_debug(
+        self,
+        uow_factory: interfaces.UnitOfWorkFactory,
+        fill_db: dict[str, list[int]],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Setup
+        mug_id: int = fill_db["product_ids"][0]
+
+        # Call
+        with caplog.at_level(logging.DEBUG, logger=UOW_LOGGER):
+            async with uow_factory() as uow:
+                await uow.products.fetch_by_id(mug_id)
+                await uow.commit()
+
+        # Assert: одна DEBUG-запись адаптера на фиксацию
+        records = [record for record in caplog.records if record.name == UOW_LOGGER]
+        assert [record.levelno for record in records] == [logging.DEBUG]
