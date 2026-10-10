@@ -21,9 +21,8 @@ def uow() -> MagicMock:
 
 @pytest.fixture(scope="function")
 def uow_factory(uow: MagicMock) -> Mock:
-    factory = Mock(interfaces.UnitOfWorkFactory)
-    factory.create.return_value = uow
-    return factory
+    # Фабрика — вызываемый объект без аргументов; мок каждый раз отдаёт тот же UoW
+    return Mock(return_value=uow)
 
 
 @pytest.fixture(scope="function")
@@ -99,7 +98,11 @@ class TestGet:
         result = await service.get(service_output.id)
 
         # Assert
-        assert uow.products.method_calls == [call.fetch_by_id(service_output.id)]
+        assert uow.mock_calls == [
+            call.__aenter__(),
+            call.products.fetch_by_id(service_output.id),
+            call.__aexit__(None, None, None),
+        ]
         assert result == service_output
 
     async def test__product_not_found(self, service: services.Product, uow: MagicMock) -> None:

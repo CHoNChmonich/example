@@ -7,6 +7,7 @@
 """
 
 import logging
+from functools import partial
 
 from orders_service.adapters import api, database
 from orders_service.application import entities, services
@@ -27,10 +28,16 @@ class Logger:
 
 
 class Adapters:
-    """Исходящие адаптеры: движок БД и фабрика Unit of Work."""
+    """Исходящие адаптеры: движок БД и фабрика Unit of Work.
+
+    ``uow_factory`` — вызываемый объект без аргументов: при каждом вызове сервис получает
+    новый ``database.UnitOfWork`` над фабрикой сессий движка; это ``partial``, а не лямбда,
+    потому что тело класса недоступно вложенным функциям, а присваивание лямбды запрещено
+    линтером.
+    """
 
     db = database.Database(settings=Settings.db)
-    uow_factory = database.UnitOfWorkFactory(session_factory=db.session_factory)
+    uow_factory = partial(database.UnitOfWork, db.session_factory)
 
 
 class Application:

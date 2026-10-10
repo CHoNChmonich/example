@@ -9,13 +9,12 @@ from .database import Database
 from .mapping import mapper
 from .settings import Settings
 from .tables import metadata
-from .unit_of_work import UnitOfWork, UnitOfWorkFactory
+from .unit_of_work import UnitOfWork
 
 __all__ = [
     "Database",
     "Settings",
     "UnitOfWork",
-    "UnitOfWorkFactory",
     "mapper",
     "metadata",
     "repositories",

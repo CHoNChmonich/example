@@ -9,6 +9,7 @@ pytest-asyncio у тестов function-scoped. Пул отключён — у �
 """
 
 from collections.abc import AsyncIterator
+from functools import partial
 
 import pytest
 from pydantic import ValidationError
@@ -22,6 +23,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import NullPool
 
 from orders_service.adapters import database  # импорт пакета регистрирует маппинг
+from orders_service.application import interfaces
 
 
 class DatabaseTestSettings(database.Settings):
@@ -73,5 +75,5 @@ async def session(
 @pytest.fixture(scope="function")
 def uow_factory(
     session_factory: async_sessionmaker[AsyncSession],
-) -> database.UnitOfWorkFactory:
-    return database.UnitOfWorkFactory(session_factory=session_factory)
+) -> interfaces.UnitOfWorkFactory:
+    return partial(database.UnitOfWork, session_factory)

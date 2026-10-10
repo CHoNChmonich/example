@@ -1,5 +1,5 @@
 from decimal import Decimal
-from unittest.mock import MagicMock, Mock, call
+from unittest.mock import ANY, MagicMock, Mock, call
 
 import pytest
 
@@ -21,9 +21,8 @@ def uow() -> MagicMock:
 
 @pytest.fixture(scope="function")
 def uow_factory(uow: MagicMock) -> Mock:
-    factory = Mock(interfaces.UnitOfWorkFactory)
-    factory.create.return_value = uow
-    return factory
+    # Фабрика — вызываемый объект без аргументов; мок каждый раз отдаёт тот же UoW
+    return Mock(return_value=uow)
 
 
 @pytest.fixture(scope="function")
@@ -181,7 +180,7 @@ class TestPlace:
         assert exc_info.value.context == {"product_id": 9, "requested": 8, "available": 7}
         uow.orders.add.assert_not_called()
         uow.commit.assert_not_called()
-        uow.__aexit__.assert_called_once()
+        uow.__aexit__.assert_called_once_with(errors.InsufficientStock, exc_info.value, ANY)
 
 
 class TestGet:
@@ -196,7 +195,11 @@ class TestGet:
         result = await service.get(100)
 
         # Assert
-        assert uow.orders.method_calls == [call.fetch_by_id(100)]
+        assert uow.mock_calls == [
+            call.__aenter__(),
+            call.orders.fetch_by_id(100),
+            call.__aexit__(None, None, None),
+        ]
         assert result.id == 100
         assert result.total == Decimal("20.00")
 
@@ -237,7 +240,11 @@ class TestFind:
         result = await service.find(filter_params)
 
         # Assert
-        assert uow.orders.method_calls == [call.fetch_all(filter_params)]
+        assert uow.mock_calls == [
+            call.__aenter__(),
+            call.orders.fetch_all(filter_params),
+            call.__aexit__(None, None, None),
+        ]
         assert [order.status for order in result] == expected_statuses
 
 
@@ -250,9 +257,13 @@ class TestPay:
         result = await service.pay(100)
 
         # Assert
-        assert uow.orders.method_calls == [call.fetch_by_id(100, for_update=True)]
+        assert uow.mock_calls == [
+            call.__aenter__(),
+            call.orders.fetch_by_id(100, for_update=True),
+            call.commit(),
+            call.__aexit__(None, None, None),
+        ]
         assert result.status is entities.OrderStatus.PAID
-        uow.commit.assert_called_once()
 
     async def test__order_already_paid(self, service: services.Order, uow: MagicMock) -> None:
         # Setup
@@ -276,6 +287,8 @@ class TestPay:
         # Call and Assert
         with pytest.raises(errors.OrderNotFound):
             await service.pay(100)
+
+        uow.commit.assert_not_called()
 
 
 class TestCancel:
@@ -317,3 +330,5 @@ class TestCancel:
         # Call and Assert
         with pytest.raises(errors.OrderNotFound):
             await service.cancel(100)
+
+        uow.commit.assert_not_called()

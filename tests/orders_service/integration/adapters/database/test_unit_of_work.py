@@ -11,9 +11,8 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from orders_service.adapters import database
 from orders_service.adapters.database import tables
-from orders_service.application import dtos, entities, errors, services
+from orders_service.application import dtos, entities, errors, interfaces, services
 
 from . import test_data
 
@@ -32,7 +31,7 @@ async def fill_db(session: AsyncSession) -> dict[str, list[int]]:
 
 
 @pytest.fixture(scope="function")
-def service(uow_factory: database.UnitOfWorkFactory) -> services.Order:
+def service(uow_factory: interfaces.UnitOfWorkFactory) -> services.Order:
     return services.Order(uow_factory=uow_factory, discount_policy=entities.NoDiscount())
 
 
@@ -152,7 +151,7 @@ class TestForUpdate:
     async def test__serializes_stock_reservation(
         self,
         service: services.Order,
-        uow_factory: database.UnitOfWorkFactory,
+        uow_factory: interfaces.UnitOfWorkFactory,
         create_test_db: AsyncEngine,
         session: AsyncSession,
         fill_db: dict[str, list[int]],
@@ -161,7 +160,7 @@ class TestForUpdate:
         # Setup
         customer_id: int = fill_db["customer_ids"][0]
         mug_id: int = fill_db["product_ids"][0]
-        async with uow_factory.create() as uow:  # остаётся ровно одна единица
+        async with uow_factory() as uow:  # остаётся ровно одна единица
             (mug,) = await uow.products.fetch_by_ids([mug_id], for_update=True)
             mug.reserve(4)
             await uow.commit()
@@ -169,7 +168,7 @@ class TestForUpdate:
         release = asyncio.Event()
 
         async def competitor() -> None:
-            async with uow_factory.create() as uow:
+            async with uow_factory() as uow:
                 (product,) = await uow.products.fetch_by_ids([mug_id], for_update=True)
                 locked.set()
                 await release.wait()
@@ -200,16 +199,16 @@ class TestForUpdate:
         assert await test_data.count_rows(tables.orders, session) == 0
 
     async def test__refreshes_product_read_earlier_without_lock(
-        self, uow_factory: database.UnitOfWorkFactory, fill_db: dict[str, list[int]]
+        self, uow_factory: interfaces.UnitOfWorkFactory, fill_db: dict[str, list[int]]
     ) -> None:
         """Под блокировкой товар перечитывается, даже если эта же транзакция уже видела его."""
         # Setup
         mug_id: int = fill_db["product_ids"][0]
 
         # Call and Assert
-        async with uow_factory.create() as uow:
+        async with uow_factory() as uow:
             stale = await uow.products.fetch_by_id(mug_id)  # без блокировки: остаток 5
-            async with uow_factory.create() as other:
+            async with uow_factory() as other:
                 (product,) = await other.products.fetch_by_ids([mug_id], for_update=True)
                 product.reserve(4)
                 await other.commit()
@@ -218,7 +217,7 @@ class TestForUpdate:
             assert locked.stock == 1
 
     async def test__relocking_keeps_pending_reservation(
-        self, uow_factory: database.UnitOfWorkFactory, fill_db: dict[str, list[int]]
+        self, uow_factory: interfaces.UnitOfWorkFactory, fill_db: dict[str, list[int]]
     ) -> None:
         """Повторная блокировка в той же транзакции не теряет ещё не сохранённый резерв:
         autoflush сбрасывает его в БД перед SELECT с populate_existing."""
@@ -226,7 +225,7 @@ class TestForUpdate:
         mug_id: int = fill_db["product_ids"][0]
 
         # Call and Assert
-        async with uow_factory.create() as uow:
+        async with uow_factory() as uow:
             (product,) = await uow.products.fetch_by_ids([mug_id], for_update=True)
             product.reserve(2)
             (again,) = await uow.products.fetch_by_ids([mug_id], for_update=True)
@@ -264,7 +263,7 @@ class TestForUpdate:
 
 class TestStorageUnavailable:
     async def test__deadlock(
-        self, uow_factory: database.UnitOfWorkFactory, fill_db: dict[str, list[int]]
+        self, uow_factory: interfaces.UnitOfWorkFactory, fill_db: dict[str, list[int]]
     ) -> None:
         """Захват двух строк в противоположном порядке разными запросами: PostgreSQL прерывает
         одну транзакцию (sqlstate 40P01), UoW переводит это в ``StorageUnavailable``."""
@@ -276,7 +275,7 @@ class TestStorageUnavailable:
         async def lock_in_order(
             first: int, second: int, mine: asyncio.Event, other: asyncio.Event
         ) -> None:
-            async with uow_factory.create() as uow:
+            async with uow_factory() as uow:
                 await uow.products.fetch_by_ids([first], for_update=True)
                 mine.set()
                 await other.wait()
@@ -300,7 +299,7 @@ class TestStorageUnavailable:
 
     async def test__lost_connection(
         self,
-        uow_factory: database.UnitOfWorkFactory,
+        uow_factory: interfaces.UnitOfWorkFactory,
         create_test_db: AsyncEngine,
         fill_db: dict[str, list[int]],
     ) -> None:
@@ -309,7 +308,67 @@ class TestStorageUnavailable:
 
         # Call and Assert
         with pytest.raises(errors.StorageUnavailable):
-            async with uow_factory.create() as uow:
+            async with uow_factory() as uow:
                 await uow.products.fetch_by_id(mug_id)  # соединение транзакции открыто
                 await _terminate_other_backends(create_test_db)  # «сеть упала»
                 await uow.products.fetch_by_ids([mug_id], for_update=True)
+
+    async def test__lost_connection_on_commit(
+        self,
+        uow_factory: interfaces.UnitOfWorkFactory,
+        create_test_db: AsyncEngine,
+        session: AsyncSession,
+        fill_db: dict[str, list[int]],
+    ) -> None:
+        # Setup
+        mug_id: int = fill_db["product_ids"][0]
+
+        # Call and Assert
+        with pytest.raises(errors.StorageUnavailable):
+            async with uow_factory() as uow:
+                (product,) = await uow.products.fetch_by_ids([mug_id], for_update=True)
+                product.reserve(1)
+                await _terminate_other_backends(create_test_db)  # «сеть упала» перед commit
+                await uow.commit()
+
+        assert await test_data.select_stock(mug_id, session) == 5
+
+
+class TestLifecycle:
+    async def test__repositories_unavailable_after_exit(
+        self, uow_factory: interfaces.UnitOfWorkFactory
+    ) -> None:
+        # Call
+        async with uow_factory() as uow:
+            pass
+
+        # Assert
+        with pytest.raises(AttributeError):
+            _ = uow.products
+        with pytest.raises(AttributeError):
+            await uow.commit()
+
+    async def test__nested_enter_rejected(self, uow_factory: interfaces.UnitOfWorkFactory) -> None:
+        # Call and Assert
+        async with uow_factory() as uow:
+            with pytest.raises(RuntimeError):
+                async with uow:
+                    pass
+
+    async def test__sequential_reuse_opens_new_session(
+        self, uow_factory: interfaces.UnitOfWorkFactory, fill_db: dict[str, list[int]]
+    ) -> None:
+        # Setup
+        mug_id: int = fill_db["product_ids"][0]
+        uow = uow_factory()
+
+        # Call
+        async with uow:
+            first = await uow.products.fetch_by_id(mug_id)
+        async with uow:
+            second = await uow.products.fetch_by_id(mug_id)
+
+        # Assert: разные сессии — разные identity map
+        assert first is not None
+        assert second is not None
+        assert first is not second

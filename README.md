@@ -115,12 +115,11 @@ flowchart LR
     end
     subgraph adapters["adapters"]
         API["api — FastAPI<br/>create_app · Controller · create_router · error_handlers"]
-        DB["database — SQLAlchemy<br/>UnitOfWorkFactory · UnitOfWork · репозитории · tables · mapping · alembic"]
+        DB["database — SQLAlchemy<br/>UnitOfWork · репозитории · tables · mapping · alembic"]
     end
     subgraph application["application — ядро"]
         SERVICES["services<br/>Customer · Product · Order"]
-        TX["transactional<br/>@transactional"]
-        INTERFACES["interfaces (порты)<br/>CustomersRepo · ProductsRepo · OrdersRepo<br/>UnitOfWork · UnitOfWorkFactory"]
+        INTERFACES["interfaces (порты)<br/>CustomersRepo · ProductsRepo · OrdersRepo<br/>UnitOfWork · UnitOfWorkFactory = Callable[[], UnitOfWork]"]
         ENTITIES["entities (домен)<br/>Customer · Product · Order · OrderLine<br/>DiscountPolicy · состояния заказа"]
         DTOS["dtos"]
         ERRORS["errors"]
@@ -131,7 +130,6 @@ flowchart LR
     ALEMBIC --> DB
     API --> SERVICES
     DB -. реализует .-> INTERFACES
-    SERVICES --> TX
     SERVICES --> INTERFACES
     SERVICES --> ENTITIES
     SERVICES --> DTOS
@@ -140,7 +138,7 @@ flowchart LR
 
 | Слой | Что внутри | Правила |
 |---|---|---|
-| `application/` | `entities.py` — весь домен; `services/` — сервис на сущность с набором методов; `interfaces/` — ABC только для **исходящих** портов; `dtos/` — Pydantic-модели входа/выхода и параметры поиска; `errors.py`; `transactional.py` — метод-обёртка транзакций | Между слоями передаются DTO и сущности, не `dict`/`list`. Входящих портов нет: контроллер зависит от конкретных `services.X` |
+| `application/` | `entities.py` — весь домен; `services/` — сервис на сущность с набором методов; `interfaces/` — ABC только для **исходящих** портов; `dtos/` — Pydantic-модели входа/выхода и параметры поиска; `errors.py` | Между слоями передаются DTO и сущности, не `dict`/`list`. Входящих портов нет: контроллер зависит от конкретных `services.X` |
 | `adapters/api/` | `create_app`, `create_lifespan`, `error_handlers`, `v1/controller.py`, `v1/router.py`, `v1/schemas` (`*Body.to_application()`), `v1/dtos` (`*Response.from_application()`) | **Обработчики — методы класса `Controller`, сервисы приходят в его конструктор. FastAPI-`Depends` не используется нигде.** `Path/Query/Body` — разбор запроса, не DI. Маршруты объявляются императивно (`add_api_route`) |
 | `adapters/database/` | `settings`, `database` (движок и фабрика сессий), `tables`, `mapping` (императивный маппинг dataclass-сущностей), `repositories/`, `unit_of_work`, `alembic/`, `migrations/` | Реализации портов носят имена портов и различаются модулем: `interfaces.OrdersRepo` / `database.repositories.OrdersRepo` |
 | `launchers/` | `api.py` — composition root HTTP-сервиса; `alembic_runner.py` — миграции; `config.py` — настройки уровня приложения | Граф собирается вручную в классах-неймспейсах при импорте модуля; все адаптеры и сервисы — синглтоны процесса |
@@ -154,47 +152,45 @@ sequenceDiagram
     participant C as Клиент
     participant R as router / Controller.place_order
     participant S as services.Order.place
-    participant T as @transactional
-    participant F as database.UnitOfWorkFactory
     participant U as database.UnitOfWork
     participant E as entities
     C->>R: POST /api/v1/orders (OrderCreateBody)
     R->>S: place(dtos.NewOrderInfo)
-    S->>T: вызов метода без uow
-    T->>F: create()
-    F-->>T: UnitOfWork(session, customers, products, orders)
-    T->>S: method(self, uow, new_order_info)
+    S->>U: self.uow_factory() → async with … as uow
+    U->>U: __aenter__: session_factory() + репозитории на сессии
     S->>U: customers.fetch_by_id
     S->>U: products.fetch_by_ids(for_update=True)
     S->>E: product.reserve(qty) · Order(...) · order.apply_discount(policy)
     S->>U: orders.add(order) → flush
-    S-->>T: dtos.Order (собран до выхода из транзакции)
-    T->>U: commit()
-    T->>U: __aexit__ → rollback (холостой), close
-    T-->>R: dtos.Order
+    S->>U: commit()
+    S->>U: __aexit__ → rollback (холостой), close
+    S-->>R: dtos.Order (собран внутри контекста)
     R-->>C: 201 OrderResponse
 ```
 
 ---
 
-## Транзакции: Unit of Work и `@transactional`
+## Транзакции: Unit of Work
 
-- **Граница транзакции = публичный метод сервиса.** Метод помечается `@transactional`
-  (`application/transactional.py`) и получает `uow` первым параметром после `self`; снаружи
-  вызывается без него. Точная типизация — PEP 612 `Concatenate`, проверяется `mypy --strict`.
-- **Новый UoW на каждый вызов.** Обёртка берёт `self.uow_factory` (порт
-  `interfaces.UnitOfWorkFactory`) и создаёт UoW вместе с репозиториями на одной сессии —
-  это и есть «UoW и репозитории создаются прямо в сервисе при вызове». Сервисы — синглтоны,
-  запросы конкурентны, поэтому сессия не может жить в `self` сервиса.
-- **Commit делает обёртка**, сервис никогда. При исключении commit не выполняется, откат делает
-  `__aexit__` UoW, исключение уходит наружу. `rollback()` в порте отсутствует: он нужен только
-  реализации.
-- **Сущности живут внутри контекста.** Выход из `async with uow` откатывает незакоммиченное и
-  сбрасывает состояние сущностей, поэтому сервисы собирают DTO до выхода и наружу отдают их.
-- **Вложенных транзакций нет.** Транзакционный метод не вызывает другой транзакционный метод;
-  общая логика выносится в приватные хелперы, принимающие `uow`.
-- **Чтения тоже идут через UoW** (`get`, `find`): репозитории существуют только внутри него;
-  commit пустой транзакции в Postgres — холостой.
+- **Граница транзакции = публичный метод сервиса.** Метод открывает её явно:
+  `async with self.uow_factory() as uow:` — и внутри работает только через репозитории
+  `uow.customers` / `uow.products` / `uow.orders`. Запись заканчивается явным
+  `await uow.commit()`, чтения commit не вызывают.
+- **Новый UoW на каждый вызов.** `uow_factory` — любой вызываемый объект без аргументов,
+  возвращающий `interfaces.UnitOfWork` (тип `interfaces.UnitOfWorkFactory`); composition root
+  передаёт `functools.partial(database.UnitOfWork, db.session_factory)`. Сессию и репозитории
+  `database.UnitOfWork` создаёт сам в `__aenter__` — это и есть «UoW и репозитории создаются
+  прямо в сервисе при вызове». Сервисы — синглтоны, запросы конкурентны, поэтому сессия не
+  может жить ни в `self` сервиса, ни в одном общем UoW.
+- **Без commit — откат.** `__aexit__` всегда откатывает незакоммиченное, закрывает сессию и
+  удаляет репозитории: исключение из метода или забытый commit не оставляют частичных
+  изменений, а вне контекста UoW непригоден (`AttributeError`; вложенный вход —
+  `RuntimeError`). `rollback()` в порте отсутствует: он нужен только реализации.
+- **Сущности живут внутри контекста**, поэтому сервисы собирают DTO до выхода и наружу
+  отдают их.
+- **Одна транзакция на метод.** Публичные методы друг друга не вызывают; общая логика
+  выносится в приватные хелперы, принимающие `uow` (`_lock_products`).
+- **Чтения тоже идут через UoW** (`get`, `find`): репозитории существуют только внутри него.
 - **Сбои хранилища** переводятся в одном месте — `database.UnitOfWork.__aexit__` — в
   `errors.StorageUnavailable` → HTTP 503 с `Retry-After`: обрыв соединения (у asyncpg это
   `InterfaceError` с флагом `connection_invalidated`, а не `OperationalError`), отказ в
@@ -234,7 +230,7 @@ stateDiagram-v2
 | Клиент | `Customer` | `NewCustomerInfo` / `Customer` | `Customer.add/get` | `CustomersRepo` | `CustomerCreateBody` → `CustomerResponse` | `create_customer` → `createCustomer`, `get_customer` → `getCustomerById` |
 | Товар | `Product` (`reserve/release`) | `NewProductInfo` / `Product` | `Product.add/get` | `ProductsRepo` | `ProductCreateBody` → `ProductResponse` | `create_product`, `get_product` |
 | Заказ | `Order` (`apply_discount/pay/cancel`), `OrderLine`, `OrderStatus` | `NewOrderInfo{lines}`, `FindOrders` / `Order{lines}` | `Order.place/get/find/pay/cancel` | `OrdersRepo` | `OrderCreateBody{lines: [OrderLineCreateBody]}`, `OrderStatus` → `OrderResponse`, `OrderListResponse` | `place_order` → `placeOrder`, `get_order`, `list_orders`, `pay_order`, `cancel_order` |
-| Транзакция | — | — | `@transactional`, `uow` первым после `self` | `UnitOfWork`, `UnitOfWorkFactory` → `database.UnitOfWork`, `database.UnitOfWorkFactory` | — | — |
+| Транзакция | — | — | `async with self.uow_factory() as uow`, `uow.commit()` | `UnitOfWork`, `UnitOfWorkFactory` (тип вызываемого объекта) → `database.UnitOfWork` | — | — |
 | Ошибки | — | — | — | `errors.Error` → категории → `CustomerNotFound` … | `api/dtos.py: ErrorResponse` | — |
 
 Правила: одинаковое имя в разных модулях различается модулем импорта; суффиксы `*Body` /
@@ -248,10 +244,10 @@ stateDiagram-v2
 
 | Принцип | Где видно |
 |---|---|
-| **S** | Сервис — сценарии одной сущности; репозиторий — персистентность одной сущности; UoW — граница транзакции; `Controller` — перевод HTTP ↔ DTO; `router.py` — маршрутизация; `error_handlers.py` — ошибки → HTTP; `@transactional` — один сквозной аспект |
-| **O** | Новая политика скидки — новый класс `DiscountPolicy` без правки `services.Order`; новый статус — новый класс состояния и строка в `_STATES`; новое хранилище — новая реализация `UnitOfWorkFactory` и репозиториев; новая ошибка — наследник категории, адаптер ошибок не меняется |
+| **S** | Сервис — сценарии одной сущности; репозиторий — персистентность одной сущности; UoW — граница транзакции; `Controller` — перевод HTTP ↔ DTO; `router.py` — маршрутизация; `error_handlers.py` — ошибки → HTTP |
+| **O** | Новая политика скидки — новый класс `DiscountPolicy` без правки `services.Order`; новый статус — новый класс состояния и строка в `_STATES`; новое хранилище — новая реализация `UnitOfWork` и репозиториев; новая ошибка — наследник категории, адаптер ошибок не меняется |
 | **L** | Любая реализация портов (SQLAlchemy, `Mock(spec=…)` в тестах) подставляется вместо абстракции; все состояния заказа выполняют контракт `_OrderState` |
-| **I** | Три узких порта репозиториев вместо одного универсального; порт `UnitOfWork` без `rollback()`; `UnitOfWorkFactory` отделён от `UnitOfWork`. Сознательный компромисс: один UoW на три репозитория — `services.Customer` получает порт, две трети которого не использует; UoW-порты по агрегатам для трёх сущностей были бы лишними |
+| **I** | Три узких порта репозиториев вместо одного универсального; порт `UnitOfWork` без `rollback()`. Сознательный компромисс: один UoW на три репозитория — `services.Customer` получает порт, две трети которого не использует; UoW-порты по агрегатам для трёх сущностей были бы лишними |
 | **D** | `application` зависит только от `interfaces` и доменных абстракций; адаптеры реализуют порты; сборка — в launcher; выбор `VolumeDiscount` и его параметры — в composition root и `.env` |
 
 ---
@@ -260,13 +256,12 @@ stateDiagram-v2
 
 | Паттерн | Класс / где | Что делает |
 |---|---|---|
-| Abstract Factory (GoF), в вырожденной форме | `interfaces.UnitOfWorkFactory` → `database.UnitOfWorkFactory.create()` | Одна операция создания; семейство объектов одной транзакции (сессия, три репозитория на ней, UoW) собирается внутри и отдаётся целиком как UoW |
+| Фабричная функция (не GoF) | `interfaces.UnitOfWorkFactory = Callable[[], UnitOfWork]`; `functools.partial(database.UnitOfWork, session_factory)` в composition root | Новый UoW на каждый вызов сервиса без класса-фабрики: сессию и репозитории UoW создаёт сам в `__aenter__` |
 | Strategy (GoF) | `entities.DiscountPolicy`: `NoDiscount`, `VolumeDiscount`; контекст — `Order.apply_discount` | Правило скидки подменяется в composition root, сервис знает только абстракцию |
 | State (GoF) | `entities._OrderState`: `_NewOrderState`, `_FinalOrderState`; `Order.pay/cancel` | Поведение заказа зависит от статуса; недопустимый переход — исключение |
 | Adapter (GoF, в широком смысле) | `adapters/database/repositories`, `database.UnitOfWork` | Приспосабливают `AsyncSession` к контрактам портов ядра |
 | Null Object (не GoF) | `entities.NoDiscount` | Ноль вместо проверки «а есть ли политика» |
 | Repository, Unit of Work, DTO (PoEAA, не GoF) | `interfaces/`, `adapters/database/`, `dtos/` | Персистентность за абстракцией, атомарная единица работы, передача данных между слоями |
-| Метод-обёртка (Python-декоратор, аспект — **не** GoF Decorator) | `application/transactional.py` | Транзакция как сквозная функциональность; меняет сигнатуру и применяется статически |
 | Composition Root | `launchers/api.py` | Единственное место, где видны все слои |
 
 Маркер «Паттерн: X (GoF)» стоит в докстринге класса-носителя.
@@ -317,13 +312,14 @@ ASCII), поэтому вход, который БД не вместит, отк
 1. Домен: поведение — в сущность (`entities.py`), ошибка — наследник категории в `errors.py`,
    ограничения новых полей — общие типы в `dtos/base.py`.
 2. Порт: метод в нужном `interfaces/*Repo`; при новой сущности — новый порт, свойство в
-   `interfaces.UnitOfWork`, свойство и параметр конструктора в `database.UnitOfWork`, создание
-   репозитория в `database.UnitOfWorkFactory.create()`, мок-репозиторий в фикстуре `uow`
+   `interfaces.UnitOfWork`, свойство в `database.UnitOfWork` и создание репозитория
+   в его `__aenter__`, мок-репозиторий в фикстуре `uow`
    модулей `tests/orders_service/unit/application/services/test_*.py`.
 3. Адаптер БД: реализация в `adapters/database/repositories/`, таблица в `tables.py`, маппинг в
    `mapping.py`, миграция: `uv run python -m orders_service.launchers.alembic_runner revision
    --autogenerate -m "<slug>" --rev-id 0002`, затем `uv run ruff check --fix` на файле миграции.
-4. Сервис: метод с `@transactional`, `uow` первым после `self`, DTO собирается внутри.
+4. Сервис: метод открывает `async with self.uow_factory() as uow:`, запись завершает
+   `await uow.commit()`, DTO собирается внутри контекста.
 5. HTTP: `*Body`/`*Response` в `api/v1/schemas` и `api/v1/dtos`, метод `Controller`,
    `add_api_route` в `router.py` с `operation_id`, тегом и картой ответов.
 6. Тесты: unit сервиса на `MagicMock(spec=UnitOfWork)`, HTTP-тест контроллера на
@@ -340,11 +336,12 @@ ASCII), поэтому вход, который БД не вместит, отк
 
 | Каталог | Что проверяет | Инфраструктура |
 |---|---|---|
-| `unit/application/services/` | сервисы на моках портов: `MagicMock(spec=interfaces.UnitOfWork)` с `Mock(interfaces.XRepo)`, порядок вызовов через `uow.mock_calls`; классы по методам (`TestAdd`, `TestGet`, `TestPlace` …), параметризация «что вернул репозиторий → что отдал сервис» | нет |
-| `unit/application/` | сущности (`test_entities.py`: State, Strategy, остатки), DTO (`test_dtos.py`: нормализация и границы), обёртка `@transactional` (`test_transactional.py`: commit / отказ от commit / новый UoW на вызов) | нет |
+| `unit/application/services/` | сервисы на моках портов: фабрика — `Mock(return_value=uow)`, `MagicMock(spec=interfaces.UnitOfWork)` с `Mock(interfaces.XRepo)`, порядок вызовов через `uow.mock_calls` (commit только у записей, новый UoW на вызов); классы по методам (`TestAdd`, `TestGet`, `TestPlace` …), параметризация «что вернул репозиторий → что отдал сервис» | нет |
+| `unit/application/` | сущности (`test_entities.py`: State, Strategy, остатки), DTO (`test_dtos.py`: нормализация и границы) | нет |
 | `unit/adapters/api/v1/` | `test_schemas.py` — граничные входы `*Body` принимаются DTO ядра (общие типы `dtos.base`) | нет |
+| `unit/launchers/` | `test_api.py` — composition root импортируется с подставленными `POSTGRES_*`, `Adapters.uow_factory()` собирает `database.UnitOfWork`, сервисы делят одну фабрику; запросов к БД нет | нет |
 | `integration/adapters/api/controllers/` | настоящий FastAPI над `Mock(services.X)` (`conftest.py`: `<x>_service`, `app`, `client`); модуль на ресурс, класс на обработчик (`TestCreateCustomer`, `TestListOrders` …); `test_error_handlers.py` — 503 с `Retry-After`, 500 без подробностей, единое тело 404/405, контракт OpenAPI | нет |
-| `integration/adapters/database/` | `conftest.py` — `create_test_db` (схема через `metadata.create_all`, без миграций), `session` (откат после теста), `uow_factory`; `test_data.py` — наборы `*_DATA` и `insert_*`; `repositories/test_*.py` — `fill_db` autouse, класс на метод репозитория (`TestFetchById`, `TestFetchAll`, `TestAdd` …); `test_unit_of_work.py` — транзакции коммитятся по-настоящему: атомарность, откат на второй строке, оплата и отмена, `FOR UPDATE` (гонка, актуальность, повторная блокировка), дедлок и обрыв соединения → `StorageUnavailable` | `TEST_POSTGRES_*` (на dev-стенде — контейнер `db_for_tests`), иначе `skip`; схема пересоздаётся на каждый тест |
+| `integration/adapters/database/` | `conftest.py` — `create_test_db` (схема через `metadata.create_all`, без миграций), `session` (откат после теста), `uow_factory`; `test_data.py` — наборы `*_DATA` и `insert_*`; `repositories/test_*.py` — `fill_db` autouse, класс на метод репозитория (`TestFetchById`, `TestFetchAll`, `TestAdd` …); `test_unit_of_work.py` — транзакции коммитятся по-настоящему: атомарность, откат на второй строке, оплата и отмена, `FOR UPDATE` (гонка, актуальность, повторная блокировка), дедлок и обрыв соединения (в теле и на commit) → `StorageUnavailable`, жизненный цикл UoW (вне контекста непригоден, вложенный вход запрещён, повторный вход — новая сессия) | `TEST_POSTGRES_*` (на dev-стенде — контейнер `db_for_tests`), иначе `skip`; схема пересоздаётся на каждый тест |
 
 Соглашения (как в hex_arch): секции `# SETUP` / `# TESTS` в модуле, фикстуры с явным `scope`
 рядом с тестами, имена `test__<метод>` и `test__<ошибка>`, комментарии `# Setup`, `# Call`,
@@ -353,7 +350,7 @@ ASCII), поэтому вход, который БД не вместит, отк
 
 Особенности моков: у `MagicMock(spec=UnitOfWork)` нужно явно задать
 `__aenter__.return_value = uow` и присвоить репозитории (spec не протаскивается в свойства);
-сервисы мокаются `Mock(services.X)`, не `create_autospec` (обёртка оставляет `__wrapped__`).
+сервисы мокаются `Mock(services.X)`, фабрика UoW — `Mock(return_value=uow)`.
 
 ---
 
@@ -362,8 +359,8 @@ ASCII), поэтому вход, который БД не вместит, отк
 | hex_arch | Здесь | Почему |
 |---|---|---|
 | Falcon + gunicorn/gevent, sync SQLAlchemy | FastAPI + uvicorn, async SQLAlchemy (asyncpg) | async-стек; HTTP-адаптер по образцу interactive_panels |
-| `TransactionContext` (сессия на поток, счётчик вложенности) + реестр `DecoratedFunctionRegistry.apply_decorators(...)` в launcher | `UnitOfWorkFactory` в конструкторе сервиса + `@transactional` | thread-local не живёт в asyncio; без глобальной мутации классов; UoW и репозитории создаются на вызов |
-| Репозитории — синглтоны с сессией из контекста | Репозитории создаются фабрикой UoW на каждую транзакцию | то же |
+| `TransactionContext` (сессия на поток, счётчик вложенности) + реестр `DecoratedFunctionRegistry.apply_decorators(...)` в launcher | вызываемая фабрика UoW в конструкторе сервиса + явный `async with self.uow_factory() as uow` в методе | thread-local не живёт в asyncio; без глобальной мутации классов; UoW и репозитории создаются на вызов |
+| Репозитории — синглтоны с сессией из контекста | Репозитории создаёт `UnitOfWork.__aenter__` на каждую транзакцию | то же |
 | `application/schemas` для параметров поиска | `FindOrders` в `dtos/order.py` | слово `schemas` занято HTTP-швом с другим смыслом |
 | Pydantic v1, `validate_arguments` на методах сервисов | Pydantic v2, без `validate_call` | вход валидируется при построении DTO на границе |
 | `ErrorMeta` (метакласс) | `__init_subclass__` + категории ошибок | меньше магии; категории дают OCP в обработчике ошибок |
@@ -371,12 +368,12 @@ ASCII), поэтому вход, который БД не вместит, отк
 | `deployment/backend/` в монорепозитории, `.env` в `components/backend/` | `deployment/` и `.env` в корне | один компонент — плоская раскладка; состав тот же: Dockerfile со стадиями (`dockerfiles/`), compose dev/prod (`docker-composes/`), `entrypoints/`, `manage/`, `nginx_config/`; подготовленных данных (`test_data.py`) нет |
 | `db` доступна только внутри сети compose | в dev `db` и `db_for_tests` публикуются на `POSTGRES_PORT` / `TEST_POSTGRES_PORT` | локальные `uv run uvicorn --reload` и `pytest` без второго Postgres; в prod — как в образце |
 | `where(entities.X.attr == …)` в запросах | `where(tables.x.c.col == …)` | под `mypy --strict` атрибуты dataclass-сущностей не `InstrumentedAttribute`; выборка всё равно возвращает сущности |
-| Без линтера | ruff + mypy strict | типизация обёртки — часть демонстрации |
+| Без линтера | ruff + mypy strict | strict-типизация портов и тестов — часть демонстрации |
 
 ---
 
 ## Что сознательно не сделано
 
-Аутентификация, брокеры сообщений, CI, фронтенд и CORS, TLS и prod-hardening, i18n, UoW-порты по агрегатам, вложенные транзакции и read-only режим обёртки — всё это
+Аутентификация, брокеры сообщений, CI, фронтенд и CORS, TLS и prod-hardening, i18n, UoW-порты по агрегатам, вложенные транзакции — всё это
 вне учебного минимума. `docs/plan.md` после реализации остаётся историей проектирования;
 действующие правила — в этом README и в докстрингах.

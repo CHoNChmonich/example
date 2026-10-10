@@ -44,31 +44,25 @@ class UnitOfWork(interfaces.UnitOfWork):
     """Транзакция SQLAlchemy над репозиториями клиентов, товаров и заказов.
 
     Паттерн: Adapter (GoF, в широком смысле) — приспосабливает ``AsyncSession`` к контракту
-    порта ``interfaces.UnitOfWork``. Соединение берётся из пула при первом запросе
-    (autobegin), поэтому вход в контекст ничего не делает; выход всегда откатывает
-    незакоммиченное и закрывает сессию.
+    порта ``interfaces.UnitOfWork``. Объект рассчитан на одну единицу работы за раз: вход в
+    контекст создаёт сессию и репозитории, выход откатывает незакоммиченное, закрывает сессию
+    и удаляет их, поэтому вне контекста репозитории и ``commit`` недоступны
+    (``AttributeError``), а вложенный вход — ошибка. Соединение берётся из пула при первом
+    запросе (autobegin).
     """
 
-    def __init__(
-        self,
-        session: AsyncSession,
-        *,
-        customers: interfaces.CustomersRepo,
-        products: interfaces.ProductsRepo,
-        orders: interfaces.OrdersRepo,
-    ) -> None:
-        """Связывает сессию и репозитории, созданные на ней фабрикой.
+    _session: AsyncSession
+    _customers: interfaces.CustomersRepo
+    _products: interfaces.ProductsRepo
+    _orders: interfaces.OrdersRepo
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        """Запоминает фабрику сессий; сессия не создаётся до входа в контекст.
 
         Args:
-            session: Сессия транзакции.
-            customers: Репозиторий клиентов на этой сессии.
-            products: Репозиторий товаров на этой сессии.
-            orders: Репозиторий заказов на этой сессии.
+            session_factory: Фабрика сессий из ``Database.session_factory``.
         """
-        self._session = session
-        self._customers = customers
-        self._products = products
-        self._orders = orders
+        self._session_factory = session_factory
 
     @property
     def customers(self) -> interfaces.CustomersRepo:
@@ -86,11 +80,20 @@ class UnitOfWork(interfaces.UnitOfWork):
         return self._orders
 
     async def __aenter__(self) -> Self:
-        """Входит в контекст; транзакция начнётся при первом запросе.
+        """Создаёт сессию и три репозитория на ней; транзакция начнётся при первом запросе.
 
         Returns:
             Сам Unit of Work.
+
+        Raises:
+            RuntimeError: Единица работы уже открыта — вложенный вход без выхода.
         """
+        if hasattr(self, "_session"):
+            raise RuntimeError("Unit of Work уже открыт: вложенный вход недопустим")
+        self._session = self._session_factory()
+        self._customers = repositories.CustomersRepo(self._session)
+        self._products = repositories.ProductsRepo(self._session)
+        self._orders = repositories.OrdersRepo(self._session)
         return self
 
     async def __aexit__(
@@ -99,7 +102,7 @@ class UnitOfWork(interfaces.UnitOfWork):
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        """Откатывает незакоммиченное, закрывает сессию и переводит сбои хранилища.
+        """Откатывает незакоммиченное, закрывает и удаляет сессию, переводит сбои хранилища.
 
         Откат после успешного commit холостой. Это единственное место перевода сбоев
         хранилища (включая ошибку commit) в ошибку ядра: исключение, поднятое здесь,
@@ -121,39 +124,10 @@ class UnitOfWork(interfaces.UnitOfWork):
             raise
         finally:
             await self._session.close()
+            del self._session, self._customers, self._products, self._orders
         if _is_transient(exc):
             raise errors.StorageUnavailable() from exc
 
     async def commit(self) -> None:
         """Фиксирует транзакцию; ошибка commit уходит в ``__aexit__`` и переводится там."""
         await self._session.commit()
-
-
-class UnitOfWorkFactory(interfaces.UnitOfWorkFactory):
-    """Паттерн: Abstract Factory (GoF) в вырожденной форме — одна операция ``create()``.
-
-    Семейство объектов одной транзакции (сессия, три репозитория на ней, UoW) собирается
-    внутри и отдаётся клиенту как единое целое.
-    """
-
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
-        """Запоминает фабрику сессий движка.
-
-        Args:
-            session_factory: Фабрика сессий из ``Database.session_factory``.
-        """
-        self._session_factory = session_factory
-
-    def create(self) -> UnitOfWork:
-        """Создаёт сессию, три репозитория на ней и Unit of Work над ними.
-
-        Returns:
-            Ещё не начатый Unit of Work; транзакция начинается при первом запросе.
-        """
-        session = self._session_factory()
-        return UnitOfWork(
-            session,
-            customers=repositories.CustomersRepo(session),
-            products=repositories.ProductsRepo(session),
-            orders=repositories.OrdersRepo(session),
-        )

@@ -23,9 +23,8 @@ def uow() -> MagicMock:
 
 @pytest.fixture(scope="function")
 def uow_factory(uow: MagicMock) -> Mock:
-    factory = Mock(interfaces.UnitOfWorkFactory)
-    factory.create.return_value = uow
-    return factory
+    # Фабрика — вызываемый объект без аргументов; мок каждый раз отдаёт тот же UoW
+    return Mock(return_value=uow)
 
 
 @pytest.fixture(scope="function")
@@ -130,7 +129,11 @@ class TestGet:
         result = await service.get(service_output.id)
 
         # Assert
-        assert uow.customers.method_calls == [call.fetch_by_id(service_output.id)]
+        assert uow.mock_calls == [
+            call.__aenter__(),
+            call.customers.fetch_by_id(service_output.id),
+            call.__aexit__(None, None, None),
+        ]
         assert result == service_output
 
     async def test__customer_not_found(self, service: services.Customer, uow: MagicMock) -> None:
@@ -143,3 +146,26 @@ class TestGet:
 
         assert exc_info.value.context == {"id": 42}
         assert uow.customers.method_calls == [call.fetch_by_id(42)]
+
+    async def test__new_unit_of_work_per_call(
+        self, service: services.Customer, uow: MagicMock, uow_factory: Mock
+    ) -> None:
+        # Setup
+        uow.customers.fetch_by_id.return_value = entities.Customer(
+            id=1, name="Иван", email="ivan@example.com"
+        )
+
+        # Call
+        await service.get(1)
+        await service.get(1)
+
+        # Assert
+        assert uow_factory.call_count == 2
+        assert uow.mock_calls == [
+            call.__aenter__(),
+            call.customers.fetch_by_id(1),
+            call.__aexit__(None, None, None),
+            call.__aenter__(),
+            call.customers.fetch_by_id(1),
+            call.__aexit__(None, None, None),
+        ]
