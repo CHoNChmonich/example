@@ -678,7 +678,7 @@ README ссылается на эти классы.
 | `ErrorMeta` (метакласс, namespaces) | `__init_subclass__` + категории ошибок | меньше магии; категории дают OCP в error-handler'е |
 | Стратегия поиска `_XStrategySelector` → 2ⁿ методов репозитория | один `OrdersRepo.fetch_all(filter_params)` с динамическим `WHERE` | Strategy показана на скидке; 2ⁿ методов — демонстрация «разнообразия подходов» hex_arch, в малом примере это шум |
 | Миграции в entrypoint API | one-shot контейнер `migrate`, API `depends_on: service_completed_successfully` | interactive_panels; API никогда не мигрирует сам |
-| `adapters/log` с JSON-форматтером | `logging.basicConfig(level=LOG_LEVEL)` в launcher'ах | минимум; без него `logger.exception` в обработчике 500 уходит в `lastResort` |
+| `adapters/log` с JSON-форматтером | `logging.basicConfig(level=LOG_LEVEL)` в launcher'ах | минимум; без него `logger.exception` в обработчике 500 уходит в `lastResort`; пересмотрено в разделе 18 |
 | Без линтера, `.editorconfig` на 90 символов | ruff (`line-length = 100`, `line-ending = "lf"`) + mypy `strict` (конфиг из interactive_panels), `.editorconfig` с `end_of_line = lf` | типизация обёртки — часть демонстрации; LF — иначе на Windows ломаются shebang/скрипты в контейнерах |
 | Комментарии и докстринги | на русском, идентификаторы на английском | оба образца |
 
@@ -927,7 +927,7 @@ SOLID, GoF, полнота; (Б) чистота кода, дизайн моду�
   `loc/msg/type`, вложенные `@app.exception_handler` без `# type: ignore`.
 - Убраны `application/schemas` (`FindOrders` → `dtos`), `application/utils`
   (`transactional.py` — модуль слоя), `api/settings.py`; добавлен `launchers/config.py`
-  (`LOG_LEVEL`, `DISCOUNT_*`); `logging.basicConfig` в launcher'ах.
+  (`LOG_LEVEL`, `DISCOUNT_*`); `logging.basicConfig` в launcher'ах (пересмотрено в разделе 18).
 - Имена: `services.Order.place` vs `entities.Order.apply_discount` (без дубля глаголов);
   `Controllers.v1_controller`; единое число для предметных модулей; сквозной словарь имён
   (раздел 5); API-перечисление статуса; методы контроллера названы.
@@ -1150,3 +1150,409 @@ SOLID, GoF, полнота; (Б) чистота кода, дизайн моду�
 пути compose-файлов в `manage/*.sh` и README. Подготовленные данные (`test_data.py`,
 `INSERT_PREPARED_DATA`) убраны по решению пользователя: стадия `development` — образ `tests` без
 добавлений, `entrypoint_api.sh` — миграции и uvicorn.
+
+---
+
+## 18. Адаптер логирования: анализ образца и план (2026-10-10)
+
+> Разделы 18.3–18.7 — версия до ревью. Итоги ревью — 18.8, действующая версия плана — 18.9.
+
+**Задача пользователя:** добавить адаптер логирования; образец — `hex_arch/adapters/log`, но
+сначала проанализировать его на соответствие практике, SOLID и GoF; план прогнать через два
+независимых ревью по чистоте архитектуры.
+
+### 18.1 Как сделано в hex_arch
+
+- `adapters/log/settings.py`: `Settings(BaseSettings)` с `LOGGING_LEVEL`, `LOGGING_JSON` и
+  свойством `LOGGING_CONFIG`, строящим полный dictConfig: форматтеры `default`/`json`
+  (`pythonjsonlogger`), один хендлер `default` → stdout, корневой логгер `""` с этим хендлером,
+  `disable_existing_loggers: True`.
+- `adapters/log/config.py`: `configure(*configs)` берёт `Settings().LOGGING_CONFIG`, сливает в него
+  `formatters`/`handlers`/`loggers` из переданных фрагментов через `dict.update` и вызывает
+  `logging.config.dictConfig`.
+- `Settings` каждого адаптера имеет своё свойство `LOGGING_CONFIG` с логгерами сторонних библиотек
+  этого адаптера (`alembic` и `sqlalchemy` при `SA_LOGS` — у database, `gunicorn`/`spectree` — у
+  API, `kombu` — у message_bus), все с `handlers: ["default"]`, `propagate: False` и уровнем из
+  собственного `LOGGING_LEVEL`.
+- Launcher: класс-неймспейс `Logger` вызывает `log.configure(Settings.db.LOGGING_CONFIG,
+  Settings.api.LOGGING_CONFIG, …)` — состав фрагментов повторяется в каждом launcher-модуле.
+- Логгеры в коде: `logging.getLogger(constants.LOGGER_PREFIX)`,
+  `logging.getLogger(self.__class__.__name__)`; слой `application` не логирует вовсе.
+
+### 18.2 Анализ
+
+**Что верно и берём:**
+
+- (G1) Логирование — инфраструктурная, сквозная забота: конфигурация живёт в адаптере и
+  применяется в composition root, ядро не знает о хендлерах и форматах (направление
+  зависимостей внутрь — D из SOLID).
+- (G2) Один хендлер в stdout и JSON-вариант для production — 12-factor, контейнеры собирают
+  stdout.
+- (G3) Знание о логгерах сторонних библиотек остаётся у адаптера, который эти библиотеки
+  использует (`kombu` → message_bus, `alembic` → database): новый адаптер приносит своих
+  логгеров без правки `log` (OCP, SRP). Идея верная, реализация — нет (B1, B3).
+
+**Что не так:**
+
+- (B1) Скрытая связность по магической строке: фрагменты всех адаптеров ссылаются на хендлер
+  `default`, объявленный внутри `log.Settings`. Переименование хендлера ломает каждый адаптер;
+  адаптеры зависят от детали реализации соседнего адаптера (нарушение DIP/OCP). Связка при этом
+  не нужна: логгеру достаточно `propagate` к корню.
+- (B2) `disable_existing_loggers: True` при `dictConfig` после импортов: логгеры, созданные на
+  уровне модулей до `configure` (`logging.getLogger(__name__)`), молча отключаются. В hex_arch
+  это не стреляет лишь потому, что логгеры берутся в `__init__` экземпляров; у нас
+  `error_handlers.logger` и `lifespan.logger` модульные — замолчали бы.
+- (B3) `Settings` как строитель: pydantic-настройки (значения из окружения) смешаны с
+  построением dictConfig (свойства `LOGGING_CONFIG` в четырёх классах Settings) — SRP. Плюс
+  `LOGGING_LEVEL` читается тремя разными Settings — дублирование одной переменной.
+- (B4) `configure()` сам создаёт `Settings()` вместо получения из composition root — скрытая
+  зависимость, не подменить в тесте, непоследовательно с остальными адаптерами (DIP).
+- (B5) Слияние фрагментов — неглубокий `dict.update`: порядок аргументов решает молча (последний
+  одноимённый логгер перетирает предыдущий), конфликтов никто не видит.
+- (B6) Имена логгеров `LOGGER_PREFIX` и `self.__class__.__name__` теряют иерархию модулей:
+  уровень не настроить по пакету, одноимённые классы разных пакетов сливаются. Практика —
+  `logging.getLogger(__name__)`.
+- (B7) `propagate: False` у корневого логгера бессмысленен; `SA_LOGS` включает логгер `sqlalchemy`
+  целиком (`pool`, `orm`, `dialects`) вместо `sqlalchemy.engine`.
+- (B8) Нет контекста запроса: записи разных HTTP-запросов неразличимы; access-лог сервера лишь
+  перенаправлен в общий хендлер.
+- (B9) «Адаптер» без порта: `adapters/log` ничего не приспосабливает к интерфейсу ядра — это
+  конфигурация инфраструктуры. Само по себе это нормально (логирование — сквозная
+  функциональность, а `logging` — готовый фасад с подключаемыми обработчиками), но называть его
+  паттерном Adapter нельзя; у нас это будет сказано явно.
+
+**GoF внутри `logging` (чтобы в README не натягивать):** иерархия логгеров с `propagate` и
+фильтры — Chain of Responsibility; хендлеры — Observer; `Formatter` — Strategy; dictConfig —
+декларативный Builder. В нашем адаптере явно называются три: Builder — чистая функция
+`build_config`, Strategy — выбор форматтера по `LOG_FORMAT`, Chain of Responsibility —
+`RequestIdFilter`.
+
+### 18.3 Решения (зафиксированы пользователем / приняты в плане)
+
+- **D1.** Логирование — сквозная функциональность: во всех слоях, включая ядро,
+  `logger = logging.getLogger(__name__)`. Порт `interfaces.Logger` не вводится (YAGNI: stdlib —
+  стабильный фасад, подмена в тестах — `caplog`). Ядро не знает о хендлерах, форматах, уровнях.
+- **D2.** `adapters/log/` — адаптер конфигурации (имя как в hex_arch, в README помечен как
+  «конфигурация инфраструктуры, не паттерн Adapter»): `settings.py` — только значения
+  (`LOG_LEVEL`, `LOG_FORMAT`), `config.py` — `build_config(settings, levels)` (чистый строитель
+  dictConfig, тестируется без побочных эффектов) и `configure(settings, *, levels, filters)`
+  (применяет `dictConfig`, навешивает фильтры на корневые хендлеры).
+- **D3.** Контракт между адаптерами — `Mapping[str, str]` «имя логгера → уровень», без имён
+  хендлеров: `database.logger_levels(settings)` и `api.logger_levels()`. Каждый такой логгер
+  настраивается как `{"level": …, "handlers": [], "propagate": True}`: уровень задан, свои хендлеры
+  сняты (так `uvicorn.*` перестают писать своим форматом), записи идут в корневой хендлер.
+  Слияние двух мапингов делает composition root (`{**a, **b}`) — конфликты имён исключены
+  составом: database знает `sqlalchemy.*`/`alembic`, api — `uvicorn.*`.
+- **D4.** `disable_existing_loggers=False`.
+- **D5.** `LOG_LEVEL` переезжает из `launchers/config.py` в `adapters/log/settings.py`;
+  `config.Settings` остаётся с `DISCOUNT_*`. Новая `LOG_FORMAT: Literal["text", "json"] = "text"`.
+- **D6.** SQL-лог — уровнем логгера `sqlalchemy.engine` (INFO при `POSTGRES_ECHO_SQL`, иначе
+  WARNING), а не `echo=True` у движка: `echo` вешает на логгер собственный `StreamHandler`, и при
+  настроенном корне каждая строка SQL пишется дважды. Имя переменной остаётся.
+- **D7.** Корреляция запросов целиком в API-адаптере (`adapters/api/request_id.py`): contextvar
+  `request_id`, чистый ASGI-middleware `RequestIdMiddleware` (берёт `X-Request-ID` из запроса или
+  генерирует uuid4, ставит contextvar на время запроса, возвращает заголовок в ответе) и
+  `RequestIdFilter(logging.Filter)`, дописывающий `record.request_id`. Log-адаптер о запросах не
+  знает: фильтры приходят в `configure(filters=…)` из composition root (OCP). Текстовый
+  форматтер печатает `%(request_id)s` с дефолтом `-` (`logging.Formatter(defaults=…)` через
+  фабрику `"()"` в dictConfig), JSON-форматтер добавляет нестандартные атрибуты записи сам.
+  Ожидается, что и `uvicorn.access` получит `request_id`: uvicorn пишет access-лог из `send()`,
+  вызываемого внутри задачи приложения, где contextvar уже установлен; проверяется на стенде.
+- **D8.** JSON — `python-json-logger` (как в hex_arch), без самописного форматтера.
+- **D9.** Логи ядра: INFO в сервисах на успешную смену состояния — `Order.place/pay/cancel`,
+  `Customer.add`, `Product.add` (идентификаторы и сумма/статус). Ожидаемые доменные ошибки не
+  логируются (их переводит обработчик ошибок; 5xx он же логирует). Сущности и `@transactional`
+  не логируют: сущности — чистый домен, обёртка — шум на каждый вызов.
+- **D10.** uvicorn запускается CLI с `--log-level` как сейчас; после импорта приложения наш
+  `dictConfig` перехватывает `uvicorn`, `uvicorn.error`, `uvicorn.access` (D3), поэтому в
+  воркерах формат единый; две-три строки master-процесса остаются в формате uvicorn — допустимо,
+  фиксируется в README. Генерация `--log-config` для uvicorn из того же `build_config` отклонена:
+  второй источник правды в деплое.
+- **D11.** Сообщения логов — на русском, как ошибки и документация проекта.
+
+### 18.4 Структура
+
+```
+orders_service/adapters/log/
+├── __init__.py        # Settings, build_config, configure; докстринг: конфигурация, не порт
+├── settings.py        # Settings(BaseSettings): LOG_LEVEL="INFO", LOG_FORMAT="text"|"json"
+└── config.py          # build_config(settings, levels) -> dict[str, Any]; configure(settings, *, levels=None, filters=())
+orders_service/adapters/database/logs.py   # logger_levels(settings) -> dict[str, str]: sqlalchemy.engine, alembic
+orders_service/adapters/api/logs.py        # logger_levels() -> dict[str, str]: uvicorn, uvicorn.error, uvicorn.access
+orders_service/adapters/api/request_id.py  # request_id: ContextVar[str | None], REQUEST_ID_HEADER, RequestIdMiddleware, RequestIdFilter
+```
+
+`build_config` (суть):
+
+```python
+{
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "text": {
+            "()": "logging.Formatter",
+            "fmt": "%(asctime)s %(levelname)-8s [%(name)s] [%(request_id)s] %(message)s",
+            "defaults": {"request_id": "-"},
+        },
+        "json": {
+            "()": "pythonjsonlogger.json.JsonFormatter",
+            "fmt": "%(asctime)s %(levelname)s %(name)s %(message)s",
+        },
+    },
+    "handlers": {
+        "stdout": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+            "formatter": settings.LOG_FORMAT,
+        }
+    },
+    "root": {"level": settings.LOG_LEVEL.upper(), "handlers": ["stdout"]},
+    "loggers": {
+        name: {"level": level, "handlers": [], "propagate": True} for name, level in levels.items()
+    },
+}
+```
+
+Composition root (`launchers/api.py`):
+
+```python
+class Settings:
+    db = database.Settings()
+    service = config.Settings()
+    log = log.Settings()
+
+
+class Logger:
+    log.configure(
+        Settings.log,
+        levels={**database.logger_levels(Settings.db), **api.logger_levels()},
+        filters=[api.RequestIdFilter()],
+    )
+```
+
+`alembic_runner.run_cmd`: `log.configure(log.Settings(), levels=database.logger_levels(db_settings))`
+с одним экземпляром `database.Settings()` на `make_config` и `logger_levels`.
+
+### 18.5 Шаги
+
+1. Зависимость `python-json-logger` (uv add); пакет `adapters/log` (D2, D4, D5); unit-тесты
+   `build_config`.
+2. `launchers/config.py` без `LOG_LEVEL`; `launchers/api.py` и `alembic_runner.py` — `configure`
+   вместо `basicConfig` (см. 18.4).
+3. database: `logs.py` с `logger_levels`, `Database.__init__` без `echo` (D6), экспорт из пакета;
+   unit-тест маппинга по `POSTGRES_ECHO_SQL`.
+4. api: `logs.py`, `request_id.py` (D7), `create_app` добавляет `RequestIdMiddleware`
+   (`app.add_middleware`), экспорт `logger_levels` и `RequestIdFilter`; unit-тесты фильтра и
+   middleware, HTTP-тест заголовка `X-Request-ID` (возврат переданного, генерация uuid4).
+5. Ядро: `logger` в `services/{order,customer,product}.py`, INFO по D9. Тестов на текст
+   сообщений нет (хрупко; `caplog` не проверяет поведение).
+6. Конфигурация и документация: `.env.example`/`.env` — `LOG_FORMAT=text` с пометкой «в
+   production — json»; `entrypoint_api.sh` без изменений; README — раздел «Логирование»
+   (где настраивается, контракт `logger_levels`, request id, `LOG_FORMAT`, почему нет порта,
+   строки master-процесса uvicorn), таблица паттернов (+ Builder `build_config`, Strategy
+   форматтер, Chain of Responsibility `RequestIdFilter`), таблица отличий от hex_arch (строка про
+   фрагменты `LOGGING_CONFIG` → `logger_levels`); CLAUDE.md — архитектура и запрет `echo`;
+   `docs/plan.md` — итоги.
+7. Проверки: ruff / mypy / pytest; на dev-стенде: `LOG_FORMAT=json` → JSON-строки с
+   `request_id`; запрос с `X-Request-ID` и без → заголовок в ответе, тот же id в записях
+   сервиса и `uvicorn.access`; `POSTGRES_ECHO_SQL=true` → каждый SQL один раз.
+
+### 18.6 Тест-план
+
+| Модуль | Кейсы |
+|---|---|
+| `unit/adapters/log/test_config.py` — `TestBuildConfig` | `test__text_formatter_by_default`, `test__json_formatter`, `test__root_level_uppercased`, `test__levels_become_propagating_loggers` (handlers `[]`, propagate `True`), `test__existing_loggers_not_disabled` |
+| `unit/adapters/api/test_request_id.py` — `TestRequestIdFilter`, `TestRequestIdMiddleware` | фильтр: `request_id` из contextvar / `-` без него; middleware: генерирует uuid4 без заголовка, пропускает переданный, contextvar установлен на время вызова приложения и сброшен после, заголовок в ответе (dummy ASGI-приложение, без FastAPI) |
+| `integration/adapters/api/controllers/test_request_id.py` — `TestRequestId` | `test__header_echoed`, `test__header_generated` через `client` |
+| `unit/adapters/database/test_logs.py` — `TestLoggerLevels` | параметризация `POSTGRES_ECHO_SQL` → уровень `sqlalchemy.engine` |
+
+`configure()` юнитами не тестируется: тонкая обёртка над `dictConfig`, а её вызов меняет глобальное
+состояние `logging` в процессе pytest (ломает `caplog`); проверяется на стенде (шаг 7).
+
+### 18.7 Сомнения для ревью
+
+1. Контракт `logger_levels() -> Mapping[str, str]` против фрагментов dictConfig (hex_arch) и
+   против «log-адаптер сам знает uvicorn/sqlalchemy/alembic» — не перебор ли ради OCP для трёх
+   адаптеров?
+2. `configure(..., filters=…)` с программным `handler.addFilter` после `dictConfig` — чисто ли,
+   или фильтр должен быть описан в самом dictConfig (`filters` с `"()"`)?
+3. `RequestIdFilter` живёт в API-адаптере и экспортируется наружу как `logging.Filter` — не
+   странно ли для HTTP-адаптера; альтернатива — contextvar и фильтр в `adapters/log`, тогда
+   API-адаптер импортирует `log` (зависимость адаптер → адаптер).
+4. Логи в сервисах ядра (D9): уровень INFO и состав полей; не логировать ли в `@transactional`.
+5. Не слишком ли много для учебного минимума: JSON, request id, логи ядра — что выкинуть.
+6. Перенос `LOG_LEVEL` в `adapters/log.Settings` и судьба `POSTGRES_ECHO_SQL` (имя оставить?).
+7. Дыры тест-плана: что холостое, чего не хватает.
+
+### 18.8 Итоги ревью плана (2026-10-10)
+
+Два независимых рецензента, оба — чистота архитектуры, разный фокус: A — границы слоёв,
+направление зависимостей, обоснованность SOLID/GoF-выводов; B — дизайн модулей, контракты,
+конфигурация, YAGNI, тест-план. BLOCKER нет. Три MAJOR найдены обоими независимо (сильный
+сигнал); расхождение одно — место фильтра request-id. Ключевые утверждения перепроверены
+скриптом (`scratchpad/verify_review_claims.py`): `add_middleware` → 500 без заголовка и id в
+обработчике; `build_middleware_stack` → заголовок и id есть; `dictConfig` принимает класс
+фильтра через `"()"`, фильтр на хендлере обогащает пропагированные записи.
+
+| # | Находка | Решение |
+|---|---|---|
+| 1 | **[MAJOR, A+B]** `app.add_middleware` ставит `RequestIdMiddleware` внутрь `ServerErrorMiddleware`: ответ 500 уходит без `X-Request-ID`, обработчик 500 и `uvicorn.access` не видят id | **Принято.** Middleware оборачивает весь стек: подкласс FastAPI переопределяет `build_middleware_stack`; класс переименован `FastApiWithout422` → `App` (два отличия от FastAPI в одном докстринге). Трассировка uvicorn «Exception in ASGI application» пишется уже после выхода из приложения и остаётся без id — принято как ограничение, в README; строка `uvicorn.access` со статусом 500 и id идёт рядом. Вариант A «не сбрасывать contextvar при исключении» отклонён: несимметричный сброс, опирается на то, что сервер даёт каждому запросу свой контекст |
+| 2 | **[MAJOR, B]** Чистый ASGI-middleware получает и `lifespan`: чтение заголовков из такого scope — `KeyError` на старте | **Принято.** `scope["type"] != "http"` → пропустить без изменений; тест |
+| 3 | **[MAJOR, A+B]** D9: INFO «заказ оформлен» пишется в сервисе до `commit()` обёртки и врёт при сбое фиксации (`StorageUnavailable`) | **Принято.** Сервисы не логируют (D1 остаётся правилом, README объясняет: сервис не знает об исходе фиксации — это и есть учебный тезис). Точка правды — DEBUG в `@transactional` после `commit()`: `"%s: транзакция зафиксирована", method.__qualname__` |
+| 4 | **[MAJOR, A+B]** `adapters/api/logs.py` с именами `uvicorn.*` — знание о сервере протекло в FastAPI-адаптер, который uvicorn не импортирует (сервер выбирают launcher и entrypoint) | **Принято.** Модуль и `api.logger_levels()` убраны; имена — константа `UVICORN_LOGGERS` в `launchers/api.py` с уровнем `NOTSET` (наследуют `LOG_LEVEL`); `alembic` не настраивается (без `fileConfig` идёт в корень); `database.logger_levels(settings)` → только `sqlalchemy.engine`, живёт в `database.py` рядом с `Database`. Контракт `logger_levels` остаётся с одним поставщиком — это уже не «общий контракт», а функция адаптера БД |
+| 5 | **[MAJOR, B] против «проверено» A:** фильтр и contextvar в API-адаптере + формат `%(request_id)s` в log-адаптере — связность по магическому имени (та же B1); A: вариант плана чище, т.к. не создаёт первой зависимости адаптер → адаптер | **Принято решение B.** `request_id` (contextvar) и `RequestIdFilter` — в `adapters/log/context.py`, фильтр объявлен в dictConfig; `configure(filters=…)`, `addFilter` и `defaults` убраны; `RequestIdMiddleware` импортирует `log.request_id` явно. Правило: `adapters/log` — инфраструктурная утилита без порта (D2), адаптеры используют её как библиотеку; обратная зависимость (`log` → `api`/`database`) запрещена; между адаптерами портов (`api` ↔ `database`) импортов нет. **Возражение A вынесено пользователю** как альтернатива (фильтр в `api`, формат log-адаптера знает поле по имени) |
+| 6 | **[MINOR, A]** источник уровня перехваченных логгеров не определён; `--log-level` entrypoint перекрывается нашим dictConfig | **Принято.** `NOTSET` для `uvicorn.*` (см. 4): `LOG_LEVEL=WARNING` глушит access-лог, `DEBUG` включает debug uvicorn; `--log-level` в entrypoint влияет только на master-процесс — в README |
+| 7 | **[MINOR, A+B]** фабрика `"()"` для `defaults` и программный `addFilter` не нужны (3.12 принимает `defaults` в dictConfig; фильтр описывается в dictConfig) | **Принято** (см. 5); форматтеры через `class`, `datefmt` явно; строится только выбранный форматтер под именем `default` (B) |
+| 8 | **[MINOR, A+B]** B5 упрекает образец в молчаливом слиянии, а D3 сливает `{**a, **b}` так же | **Принято частично.** B5 переформулирован: не дефект сам по себе, риск при четырёх источниках с разными дефолтами. У нас два источника с заведомо разными именами, слияние в composition root; проверка пересечения не добавляется (YAGNI) |
+| 9 | **[MINOR, A+B]** GoF-маркировки натянуты: функция с литералом словаря — не Builder, выбор имени форматтера — не Strategy, фильтр, всегда возвращающий `True`, — не CoR | **Принято.** В таблицу паттернов README ничего не добавляется; одна фраза в разделе «Логирование»: `logging` сам построен на Observer/Strategy/Chain of Responsibility, адаптер их только конфигурирует. `build_config` → `make_config` (единый глагол с `alembic_runner.make_config`) |
+| 10 | **[MINOR, A+B]** `LOG_LEVEL: str` без валидации: `VERBOSE`/`TRACE` валят процесс внутри `dictConfig` | **Принято.** `Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]` + `field_validator(mode="before")` с `.upper()` — ошибка конфигурации на старте, как у остальных Settings |
+| 11 | **[MINOR, A+B]** `X-Request-ID` клиента без ограничений попадает в лог и ответ | **Принято.** Принимается только `^[A-Za-z0-9._-]{1,64}$`, иначе генерируется uuid4; тест |
+| 12 | **[MINOR, B]** JSON-форматтер — самая низкая учебная ценность, выкинуть | **Отклонено**, вынесено пользователю: паритет с hex_arch (`LOGGING_JSON`), стандарт для контейнеров; после п. 7 цена — одна ветка `if` и зависимость `python-json-logger` |
+| 13 | **[MINOR, A+B]** тест-план: четыре структурных теста холостые; нет кейсов на 500, на сброс contextvar при исключении, на passthrough `lifespan`, на валидность uuid4; `configure` можно проверить в subprocess | **Принято.** Структурных тестов два (`levels` → `loggers`; выбор форматтера); поведение `configure` — smoke-тест в subprocess; middleware и HTTP-кейсы — см. 18.9 |
+| 14 | **[NIT, A+B]** имена и забытые правки: `request_id.py` против переменной `request_id`; `logs.py` читается как «логи»; `Settings.log = log.Settings()` затеняет модуль; CLAUDE.md относит `LOG_LEVEL` к `launchers/config.py`; строки плана 681 и 930 противоречат разделу 18; README без `log` в диаграмме и таблице слоёв; `__init__.py` новых тестовых пакетов; `uv.lock` | **Принято.** Contextvar уезжает в `log.context` (конфликт имён исчезает); `logs.py` нет; `Settings.logging = log.Settings()`; остальное — в шаг 6; строки 681/930 помечены как пересмотренные |
+| 15 | **[NIT, A]** уточнения к 18.2: B2 — при `disable_existing_loggers: True` глушатся и сторонние логгеры, созданные при импорте (`sqlalchemy.engine.Engine` при `SA_LOGS=false` — навсегда); B3 — четыре Settings с `LOGGING_LEVEL` и разными дефолтами (`med_sharing_api` — `DEBUG`); B7 — `pool`/`orm` ощутимы только на DEBUG | **Принято** как уточнения анализа (здесь, без правки 18.2) |
+| 16 | **[MINOR, A, вне скоупа]** 503 пишется без причины: `handle_app_error` логирует `exc.message`, `__cause__` (SQLSTATE/текст asyncpg) не попадает в лог нигде | **Вопрос пользователю:** починить сейчас (одна строка: `__cause__` в сообщение, без трассировки; тест `exc_info is None` остаётся) / в техдолг / не трогать. Рекомендация — починить в рамках этой задачи |
+
+### 18.9 План v2 — действующий (после ревью)
+
+**Решения:**
+
+- **D1** (без изменений): stdlib `logging.getLogger(__name__)` в любом слое, порта нет.
+- **D2'**: `adapters/log` — инфраструктурная утилита без порта: `settings.py` (значения),
+  `config.py` (`make_config`, `configure`), `context.py` (`request_id`, `RequestIdFilter`).
+  Адаптеры могут импортировать `log` как библиотеку; `log` не импортирует адаптеры; между
+  `api` и `database` импортов нет.
+- **D3'**: уровни логгеров сторонних библиотек: `database.logger_levels(settings)` →
+  `{"sqlalchemy.engine": "INFO" | "WARNING"}`; имена uvicorn — `UVICORN_LOGGERS` в
+  `launchers/api.py` с `NOTSET`; слияние — в composition root. Каждый такой логгер в dictConfig:
+  `{"level": …, "handlers": [], "propagate": True}`.
+- **D4**: `disable_existing_loggers=False`. **D6**: без `echo` у движка. **D8**: JSON через
+  `python-json-logger` (на решение пользователя). **D10**: uvicorn CLI с `--log-level` (влияет
+  только на master-процесс). **D11**: сообщения на русском.
+- **D5'**: `LOG_LEVEL: Literal[...]` с валидатором регистра и `LOG_FORMAT: Literal["text", "json"]`
+  в `log.Settings`; `launchers/config.py` остаётся с `DISCOUNT_*`.
+- **D7'**: contextvar и фильтр — в `log.context`; `RequestIdMiddleware` — в
+  `adapters/api/request_id.py`, стоит снаружи всего стека (`App.build_middleware_stack`),
+  пропускает не-HTTP scope, принимает `X-Request-ID` по регулярному выражению или генерирует
+  uuid4, возвращает заголовок, всегда сбрасывает contextvar в `finally`. Ограничение:
+  трассировка uvicorn для 500 без id (строка `uvicorn.access` с id рядом).
+- **D9'**: сервисы не логируют; `@transactional` пишет DEBUG после `commit()`.
+
+**Структура:**
+
+```
+orders_service/adapters/log/
+├── __init__.py      # Settings, make_config, configure, request_id, RequestIdFilter
+├── settings.py      # LOG_LEVEL (Literal + upper), LOG_FORMAT
+├── config.py        # make_config(settings, levels) -> dict[str, Any]; configure(settings, *, levels) -> None
+└── context.py       # request_id: ContextVar[str | None]; RequestIdFilter: record.request_id = значение или "-"
+orders_service/adapters/api/request_id.py      # REQUEST_ID_HEADER, регулярное выражение, RequestIdMiddleware (ставит log.request_id)
+orders_service/adapters/api/app.py             # App(FastAPI): openapi() без 422, build_middleware_stack() с RequestIdMiddleware снаружи
+orders_service/adapters/database/database.py   # + logger_levels(settings)
+orders_service/launchers/api.py                # UVICORN_LOGGERS; Settings.logging; Logger: log.configure(...)
+orders_service/application/transactional.py    # DEBUG после commit
+```
+
+`make_config` (суть):
+
+```python
+def make_config(settings: Settings, levels: Mapping[str, str]) -> dict[str, Any]:
+    formatter: dict[str, Any] = (
+        {
+            "class": "pythonjsonlogger.json.JsonFormatter",
+            "format": "%(asctime)s %(levelname)s %(name)s %(message)s",
+        }
+        if settings.LOG_FORMAT == "json"
+        else {"format": "%(asctime)s %(levelname)-8s [%(name)s] [%(request_id)s] %(message)s"}
+    )
+    formatter["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "filters": {"request_id": {"()": RequestIdFilter}},
+        "formatters": {"default": formatter},
+        "handlers": {
+            "stdout": {
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout",
+                "formatter": "default",
+                "filters": ["request_id"],
+            }
+        },
+        "root": {"level": settings.LOG_LEVEL, "handlers": ["stdout"]},
+        "loggers": {
+            name: {"level": level, "handlers": [], "propagate": True}
+            for name, level in levels.items()
+        },
+    }
+```
+
+JSON-форматтер включает `request_id` автоматически: фильтр кладёт атрибут в каждую запись,
+python-json-logger добавляет нестандартные атрибуты записи в JSON.
+
+Composition root:
+
+```python
+UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
+
+
+class Settings:
+    db = database.Settings()
+    service = config.Settings()
+    logging = log.Settings()
+
+
+class Logger:
+    log.configure(
+        Settings.logging,
+        levels={**database.logger_levels(Settings.db), **dict.fromkeys(UVICORN_LOGGERS, "NOTSET")},
+    )
+```
+
+`alembic_runner.run_cmd`: `log.configure(log.Settings(), levels=database.logger_levels(db_settings))`.
+
+**Шаги:**
+
+1. `uv add python-json-logger` (обновляет `uv.lock`); пакет `adapters/log` (settings, config,
+   context, `__init__`); тесты: `tests/orders_service/unit/adapters/log/` (`__init__`,
+   `test_settings`, `test_config`, `test_context`), `tests/orders_service/integration/adapters/log/`
+   (`__init__`, `test_configure` — subprocess).
+2. launchers: `config.py` без `LOG_LEVEL`; `api.py` — `UVICORN_LOGGERS`, `Settings.logging`,
+   `Logger` через `configure`; `alembic_runner.py` — `configure` вместо `basicConfig`.
+3. database: `logger_levels` в `database.py`, `Database.__init__` без `echo`, экспорт из
+   пакета; тест `tests/orders_service/unit/adapters/database/test_database.py`.
+4. api: `request_id.py`; `app.py` — `App` с `build_middleware_stack`; тесты: unit
+   `tests/orders_service/unit/adapters/api/test_request_id.py`, HTTP
+   `tests/orders_service/integration/adapters/api/controllers/test_request_id.py`.
+5. Ядро: DEBUG в `@transactional` после commit; тест в `test_transactional.py` (`caplog`,
+   уровень и логгер, без привязки к полному тексту).
+6. Конфигурация и документация: `.env.example`/`.env` — блок «Логирование
+   (adapters/log/settings.py)»: `LOG_LEVEL`, `LOG_FORMAT=text` (prod — json); CLAUDE.md —
+   настройки, правило импорта `adapters/log`, запрет `echo`, ограничение трассировки 500;
+   README — раздел «Логирование», диаграмма и таблица слоёв с `log`, `FastApiWithout422` → `App`,
+   таблица отличий от hex_arch (фрагменты `LOGGING_CONFIG` → `logger_levels` + константа
+   launcher), фраза о паттернах внутри `logging`; строки плана 681/930 помечены; итоги в
+   `docs/plan.md`.
+7. Проверки: ruff / mypy / pytest; dev-стенд: `LOG_FORMAT=json` → JSON с `request_id` в записях
+   `uvicorn.access`; запрос с валидным, невалидным и без `X-Request-ID`; `POSTGRES_ECHO_SQL=true`
+   → каждый SQL один раз; `LOG_LEVEL=WARNING` → access-лог молчит; `LOG_LEVEL=DEBUG` → строка
+   «транзакция зафиксирована».
+
+**Тест-план v2:**
+
+| Модуль | Кейсы |
+|---|---|
+| `unit/adapters/log/test_settings.py` — `TestSettings` | `test__level_uppercased` (`Settings(LOG_LEVEL="debug", _env_file=None)`), `test__unknown_level_rejected` (`TRACE` → `ValidationError`) |
+| `unit/adapters/log/test_config.py` — `TestMakeConfig` | `test__levels_become_propagating_loggers` (`handlers: []`, `propagate: True`, уровень как передан), `test__formatter_selected_by_format` (text: формат с `request_id`; json: класс `pythonjsonlogger.json.JsonFormatter`) |
+| `unit/adapters/log/test_context.py` — `TestRequestIdFilter` | `test__request_id_from_context`, `test__dash_without_context`, `test__record_passes` |
+| `integration/adapters/log/test_configure.py` — `TestConfigure` (subprocess, параметризация `LOG_FORMAT`) | дочерний процесс: `configure`, запись из логгера, созданного до `configure`, запись `uvicorn.access` при установленном `request_id`; текст — regex с `[-]` и с id; json — парсится, содержит `request_id`, `levelname`, `name`, `message` |
+| `unit/adapters/api/test_request_id.py` — `TestRequestIdMiddleware` (dummy ASGI, без FastAPI) | `test__generates_uuid4`, `test__accepts_valid_header`, `test__rejects_invalid_header` (параметризация: длина > 64, недопустимые символы → сгенерирован), `test__context_set_during_app_and_reset_after`, `test__context_reset_after_exception`, `test__header_in_response`, `test__non_http_scope_passthrough` |
+| `integration/adapters/api/controllers/test_request_id.py` — `TestRequestId` | `test__header_echoed`, `test__header_generated`, `test__header_on_error_responses` (параметризация: 404 неизвестный путь, 503 `StorageUnavailable` из мока сервиса, 500 необработанное исключение с `raise_app_exceptions=False`) |
+| `unit/adapters/database/test_database.py` — `TestLoggerLevels` | параметризация `POSTGRES_ECHO_SQL` → `{"sqlalchemy.engine": "INFO" / "WARNING"}` |
+| `unit/application/test_transactional.py` — `TestTransactional` | `test__commit_logged_at_debug` (`caplog`, логгер `orders_service.application.transactional`, уровень DEBUG, `__qualname__` метода в сообщении) |
+
+**На решение пользователя:** (1) место фильтра request-id — принят вариант B (в `log`),
+альтернатива A — в `api`; (2) оставить ли JSON-форматтер; (3) `__cause__` в WARNING для 503
+(п. 16) — сейчас / техдолг / не трогать; (4) ограничение «трассировка 500 без id» принять как
+есть или не сбрасывать contextvar на пути исключения (вариант A).
+
