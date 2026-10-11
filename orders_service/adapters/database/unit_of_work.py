@@ -20,29 +20,6 @@ logger = logging.getLogger(__name__)
 _TRANSIENT_SQLSTATES = frozenset({"40001", "40P01", "53300", "57P01", "57P02", "57P03"})
 
 
-def _is_transient(exc: BaseException | None) -> bool:
-    """Определяет, является ли исключение временным сбоем хранилища.
-
-    Временными считаются: невозможность установить соединение (отказ или таймаут),
-    неразрешимое имя хоста, исчерпание пула, разрыв соединения (диалект asyncpg не порождает
-    ``OperationalError`` — обрыв приходит ``InterfaceError`` с флагом ``connection_invalidated``,
-    «соединение признано мёртвым»), а также ошибки сервера с кодами из ``_TRANSIENT_SQLSTATES``.
-
-    Args:
-        exc: Исключение, вышедшее из тела транзакции, отката или commit; ``None``, если его нет.
-
-    Returns:
-        ``True``, если операцию имеет смысл повторить.
-    """
-    if isinstance(exc, ConnectionError | TimeoutError | socket.gaierror | PoolTimeoutError):
-        return True
-    if isinstance(exc, DBAPIError):
-        if exc.connection_invalidated or isinstance(exc, OperationalError):
-            return True
-        return getattr(exc.orig, "sqlstate", None) in _TRANSIENT_SQLSTATES
-    return False
-
-
 class UnitOfWork(interfaces.UnitOfWork):
     """Транзакция SQLAlchemy над репозиториями клиентов, товаров и заказов.
 
@@ -122,20 +99,45 @@ class UnitOfWork(interfaces.UnitOfWork):
         try:
             await self._session.rollback()
         except Exception as rollback_error:
-            if _is_transient(rollback_error):
+            if self._is_transient(rollback_error):
                 raise errors.StorageUnavailable() from rollback_error
             raise
         finally:
             await self._session.close()
             del self._session, self._customers, self._products, self._orders
-        if _is_transient(exc):
+        if self._is_transient(exc):
             raise errors.StorageUnavailable() from exc
 
     async def commit(self) -> None:
         """Фиксирует транзакцию; ошибка commit уходит в ``__aexit__`` и переводится там.
 
         Об исходе фиксации знает только адаптер, поэтому DEBUG-запись о ней живёт здесь,
-        а не в сервисах; с запросом её связывает ``request_id`` записи.
+        а не в сервисах; с запросом её связывает ``trace_id`` записи.
         """
         await self._session.commit()
         logger.debug("Транзакция зафиксирована")
+
+    @staticmethod
+    def _is_transient(exc: BaseException | None) -> bool:
+        """Определяет, является ли исключение временным сбоем хранилища.
+
+        Временными считаются: невозможность установить соединение (отказ или таймаут),
+        неразрешимое имя хоста, исчерпание пула, разрыв соединения (диалект asyncpg не
+        порождает ``OperationalError`` — обрыв приходит ``InterfaceError`` с флагом
+        ``connection_invalidated``, «соединение признано мёртвым»), а также ошибки сервера
+        с кодами из ``_TRANSIENT_SQLSTATES``.
+
+        Args:
+            exc: Исключение, вышедшее из тела транзакции, отката или commit; ``None``, если
+                его нет.
+
+        Returns:
+            ``True``, если операцию имеет смысл повторить.
+        """
+        if isinstance(exc, ConnectionError | TimeoutError | socket.gaierror | PoolTimeoutError):
+            return True
+        if isinstance(exc, DBAPIError):
+            if exc.connection_invalidated or isinstance(exc, OperationalError):
+                return True
+            return getattr(exc.orig, "sqlstate", None) in _TRANSIENT_SQLSTATES
+        return False
