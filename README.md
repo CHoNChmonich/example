@@ -24,7 +24,7 @@ tests / development / production`), `docker-composes/dev/docker-compose.dev.yml`
 1. Скопируйте `.env.example` в `.env` (Windows: `copy .env.example .env`) и при необходимости
    поправьте значения. Если порт 5432 на машине занят, задайте другие хостовые порты
    (`POSTGRES_PORT=5433`, `TEST_POSTGRES_PORT=5434`): внутри compose контейнеры ходят на
-   `db:5432` и `db_for_tests:5432`.
+   `db:5432` и (на dev-стенде) `db_for_tests:5432`.
 2. Перейдите в каталог деплоя: `cd deployment`.
 3. Запустите стенд (на Windows — из Git Bash):
    - разработка: `bash ./manage/start.sh --dev` (compose в foreground, логи в консоли);
@@ -37,7 +37,7 @@ tests / development / production`), `docker-composes/dev/docker-compose.dev.yml`
 |---|---|---|---|
 | `api` | `entrypoint_api.sh`: ждёт БД, применяет миграции (`entrypoint_alembic.sh`), затем запускает uvicorn (`API_WORKER_COUNT`, `LOG_LEVEL`, `ADDITIONAL_API_ARGS`) | стадия `development`; порт `APP_PORT` (8000) наружу | стадия `production` — только установленный пакет, non-root; наружу не публикуется |
 | `db` | PostgreSQL 17, volume с данными | публикуется на `POSTGRES_PORT` для локальных запусков | только внутри сети |
-| `db_for_tests`, `api_for_tests` | отдельная БД без volume и прогон `tests/orders_service/integration` (`entrypoint_tests.sh`, стадия `tests`; unit-тесты выполняются при сборке образа) | падение тестов не роняет стенд — смотреть лог | `api` стартует только после успешного прогона |
+| `db_for_tests`, `api_for_tests` | отдельная БД без volume и прогон `tests/orders_service/integration` (`entrypoint_tests.sh`, стадия `tests`; unit-тесты выполняются при сборке образа) | падение тестов не роняет стенд — смотреть лог | нет: тесты — дело сборки образа и dev-стенда, production поднимает только то, что нужно для работы |
 | `pgadmin` | веб-интерфейс к БД (`PGADMIN_EMAIL` / `PGADMIN_PASSWORD`) | порт 5050 и через nginx `/pgadmin4/` | только через nginx |
 | `nginx` | reverse proxy перед API и pgAdmin (`nginx_config/`) | `NGINX_EXTERNAL_PORT` (8080) | то же; `/docs`, `/redoc`, `/openapi.json` закрыты |
 
@@ -477,30 +477,3 @@ ASCII), поэтому вход, который БД не вместит, отк
 сценарии мокаются по входящим портам — `Mock(interfaces.X)` (абстрактные `async`-методы дают
 `AsyncMock`), фабрика UoW — `Mock(return_value=uow)`.
 
----
-
-## Принятые решения (глоссарий)
-
-| Решение | Почему |
-|---|---|
-| FastAPI + uvicorn, async SQLAlchemy (asyncpg) | async-стек целиком, без смешения sync и async |
-| Вызываемая фабрика UoW в конструкторе сервиса + явный `async with self.uow_factory() as uow` в методе | thread-local сессия не живёт в asyncio; без глобальной мутации классов декораторами-реестрами; UoW и репозитории создаются на вызов |
-| Репозитории создаёт `UnitOfWork.__aenter__` на каждую транзакцию | то же: синглтон-репозиторий с сессией из контекста несовместим с конкурентными запросами |
-| `adapters/log` + `database.logger_levels` и `UVICORN_LOGGERS` в launcher: только имя логгера → уровень, `propagate` в корень; `trace_id` спана через фильтр | без связности по имени хендлера в настройках адаптеров; `disable_existing_loggers=False`; имена логгеров — `__name__`; корреляция запросов — трассой, без отдельного request id |
-| OpenTelemetry: встроенная телеметрия FastAPI, декораторы над портами (сценарии, единица работы), `TracedPool`, слушатели SQLAlchemy, `trace_id` в логах | наблюдаемость запроса сквозь слои без правок ядра и адаптера БД |
-| Входящие порты `interfaces.Customer/Product/Order`: контроллер и декораторы зависят от них, а не от `services.X` | GoF Decorator над сценарием требует абстракции (DIP, OCP) |
-| `FindOrders` в `dtos/order.py`, а не в отдельном `schemas` | слово `schemas` занято HTTP-швом с другим смыслом |
-| Pydantic v2, без `validate_call` на методах сервисов | вход валидируется при построении DTO на границе |
-| `__init_subclass__` + категории ошибок вместо метакласса | меньше магии; категории дают OCP в обработчике ошибок |
-| `OrdersRepo.fetch_all(FindOrders)` с динамическим `WHERE` вместо метода на каждую комбинацию фильтров | один метод вместо 2ⁿ; Strategy показана на скидке |
-| `deployment/` и `.env` в корне | один компонент — плоская раскладка: Dockerfile со стадиями (`dockerfiles/`), compose dev/prod (`docker-composes/`), `entrypoints/`, `manage/`, `nginx_config/` |
-| В dev `db` и `db_for_tests` публикуются на `POSTGRES_PORT` / `TEST_POSTGRES_PORT`, в prod — только внутри сети compose | локальные `uv run uvicorn --reload` и `pytest` без второго Postgres |
-| `where(tables.x.c.col == …)` в запросах, а не атрибуты сущностей | под `mypy --strict` атрибуты dataclass-сущностей не `InstrumentedAttribute`; выборка всё равно возвращает сущности |
-| ruff + mypy strict, включая тесты | strict-типизация портов и тестов — часть демонстрации |
-
----
-
-## Что сознательно не сделано
-
-Аутентификация, брокеры сообщений, CI, фронтенд и CORS, TLS и prod-hardening, i18n, UoW-порты по агрегатам, вложенные транзакции — всё это
-вне учебного минимума. Действующие правила — в этом README и в докстрингах.

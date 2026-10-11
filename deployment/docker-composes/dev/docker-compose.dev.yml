@@ -75,7 +75,6 @@ services:
     environment:
       TEST_POSTGRES_HOST: db_for_tests
       TEST_POSTGRES_PORT: "5432"
-      API_ENV: development
     entrypoint: ["entrypoint_tests.sh"]
     networks:
       - app_dev_network

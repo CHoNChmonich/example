@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
-# Прогон интеграционных тестов на отдельной БД (контейнер api_for_tests). В development
-# падение тестов не роняет стенд (смотреть лог), в production контейнер завершается с ошибкой,
-# и api не стартует.
+# Прогон интеграционных тестов на отдельной БД (контейнер api_for_tests dev-стенда).
+# Падение тестов не роняет стенд — смотреть лог контейнера.
 
 set -e
 
-if [[ $API_ENV == 'development' ]]; then
-  # Выводим параметры подключения (без пароля)
-  echo
-  echo "TEST_POSTGRES_HOST: $TEST_POSTGRES_HOST"
-  echo "TEST_POSTGRES_PORT: $TEST_POSTGRES_PORT"
-  echo "TEST_POSTGRES_DB: $TEST_POSTGRES_DB"
-  echo "TEST_POSTGRES_USER: $TEST_POSTGRES_USER"
-fi
+# Выводим параметры подключения (без пароля)
+echo
+echo "TEST_POSTGRES_HOST: $TEST_POSTGRES_HOST"
+echo "TEST_POSTGRES_PORT: $TEST_POSTGRES_PORT"
+echo "TEST_POSTGRES_DB: $TEST_POSTGRES_DB"
+echo "TEST_POSTGRES_USER: $TEST_POSTGRES_USER"
 
 echo
 echo "Waiting for database to start..."
@@ -21,16 +18,8 @@ timeout 30 bash -c \
 
 echo
 echo "Running integration tests..."
-set +e
-pytest -q ./tests/orders_service/integration
-integration_test_status=$?
-set -e
-
-if [[ $integration_test_status -ne 0 ]]; then
+if ! pytest -q ./tests/orders_service/integration; then
   echo "One or more integration tests failed" >&2
-  if [[ $API_ENV == 'production' ]]; then
-    exit "$integration_test_status"
-  fi
   exit 0
 fi
 

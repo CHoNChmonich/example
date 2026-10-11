@@ -50,7 +50,8 @@ RUN uv sync --frozen --no-dev --no-editable
 
 # ====================================================
 # Тесты: dev-зависимости, исходники и тесты. Unit-тесты выполняются при сборке образа,
-# интеграционные — при запуске контейнера (entrypoint_tests.sh, отдельная БД)
+# интеграционные — при запуске контейнера api_for_tests dev-стенда (entrypoint_tests.sh,
+# отдельная БД)
 FROM dependency-installer AS tests
 
 COPY orders_service ./orders_service
