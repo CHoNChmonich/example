@@ -1,4 +1,7 @@
 import logging
+import re
+
+from opentelemetry.sdk.trace import TracerProvider
 
 from orders_service.adapters import log
 
@@ -13,29 +16,30 @@ def _record() -> logging.LogRecord:
 # ---------------------------------------------------------------------------------------
 # TESTS
 # ---------------------------------------------------------------------------------------
-class TestRequestIdFilter:
-    def test__request_id_from_context(self) -> None:
-        # Setup
-        record = _record()
-        token = log.request_id.set("abc")
-
-        # Call
-        try:
-            passed = log.RequestIdFilter().filter(record)
-        finally:
-            log.request_id.reset(token)
-
-        # Assert
-        assert passed is True
-        assert record.__dict__["request_id"] == "abc"
-
-    def test__dash_without_context(self) -> None:
+class TestLogContextFilter:
+    def test__dashes_without_span(self) -> None:
         # Setup
         record = _record()
 
         # Call
-        passed = log.RequestIdFilter().filter(record)
+        passed = log.LogContextFilter().filter(record)
 
         # Assert
         assert passed is True
-        assert record.__dict__["request_id"] == "-"
+        assert record.__dict__["trace_id"] == "-"
+        assert record.__dict__["span_id"] == "-"
+
+    def test__trace_ids_from_current_span(self) -> None:
+        # Setup: локальный провайдер — текущий спан живёт в contextvars, глобальный не нужен
+        record = _record()
+        tracer = TracerProvider().get_tracer("test")
+
+        # Call
+        with tracer.start_as_current_span("span") as span:
+            passed = log.LogContextFilter().filter(record)
+
+        # Assert
+        assert passed is True
+        assert record.__dict__["trace_id"] == f"{span.get_span_context().trace_id:032x}"
+        assert re.fullmatch(r"[0-9a-f]{32}", record.__dict__["trace_id"])
+        assert re.fullmatch(r"[0-9a-f]{16}", record.__dict__["span_id"])

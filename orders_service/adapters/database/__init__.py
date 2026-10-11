@@ -4,7 +4,7 @@
 ``mapping``), поэтому composition root и тесты импортируют именно пакет, а не отдельные модули.
 """
 
-from . import repositories
+from . import repositories, spans
 from .database import Database, logger_levels
 from .mapping import mapper
 from .settings import Settings
@@ -19,4 +19,5 @@ __all__ = [
     "mapper",
     "metadata",
     "repositories",
+    "spans",
 ]

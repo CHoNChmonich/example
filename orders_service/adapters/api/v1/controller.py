@@ -1,9 +1,11 @@
-"""Обработчики HTTP v1: разбор запроса → DTO ядра → сервис → DTO ответа.
+"""Обработчики HTTP v1: разбор запроса → DTO ядра → сценарий → DTO ответа.
 
-Класс получает сервисы через конструктор из composition root — тот же «чистый» DI, что и у
-остальных адаптеров; FastAPI-``Depends`` не используется. ``Path``/``Query``/``Body`` ниже —
-разбор запроса, а не внедрение зависимостей. Границы параметров пути и запроса — те же,
-что у DTO ядра (``dtos.base``).
+Класс получает входящие порты сценариев (``interfaces.Customer/Product/Order``) через
+конструктор из composition root — тот же «чистый» DI, что и у остальных адаптеров;
+FastAPI-``Depends`` не используется. Зависимость от порта, а не от ``services.X``, позволяет
+composition root подставить декоратор (трассировка) без правки контроллера.
+``Path``/``Query``/``Body`` ниже — разбор запроса, а не внедрение зависимостей. Границы
+параметров пути и запроса — те же, что у DTO ядра (``dtos.base``).
 """
 
 from typing import Annotated
@@ -13,7 +15,7 @@ from fastapi import Body, Path, Query
 from orders_service.adapters.api.v1 import dtos as api_dtos
 from orders_service.adapters.api.v1 import schemas as api_schemas
 from orders_service.application import dtos as app_dtos
-from orders_service.application import services
+from orders_service.application import interfaces
 
 EntityIdPath = Annotated[int, Path(ge=1, le=app_dtos.MAX_INT32)]
 
@@ -30,11 +32,11 @@ class Controller:
     def __init__(
         self,
         *,
-        customer: services.Customer,
-        product: services.Product,
-        order: services.Order,
+        customer: interfaces.Customer,
+        product: interfaces.Product,
+        order: interfaces.Order,
     ) -> None:
-        """Принимает сервисы из composition root.
+        """Принимает порты сценариев из composition root.
 
         Args:
             customer: Сценарии клиента.

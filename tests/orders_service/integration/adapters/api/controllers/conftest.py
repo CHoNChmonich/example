@@ -1,4 +1,4 @@
-"""Тесты контроллеров: настоящее приложение FastAPI поверх моков сервисов (как в hex_arch)."""
+"""Тесты контроллеров: настоящее приложение FastAPI поверх моков портов сценариев."""
 
 from collections.abc import AsyncIterator
 from unittest.mock import Mock
@@ -8,22 +8,22 @@ import pytest
 from fastapi import FastAPI
 
 from orders_service.adapters.api import V1Controller, create_app
-from orders_service.application import services
+from orders_service.application import interfaces
 
 
 @pytest.fixture(scope="function")
 def customer_service() -> Mock:
-    return Mock(services.Customer)
+    return Mock(interfaces.Customer)
 
 
 @pytest.fixture(scope="function")
 def product_service() -> Mock:
-    return Mock(services.Product)
+    return Mock(interfaces.Product)
 
 
 @pytest.fixture(scope="function")
 def order_service() -> Mock:
-    return Mock(services.Order)
+    return Mock(interfaces.Order)
 
 
 @pytest.fixture(scope="function")

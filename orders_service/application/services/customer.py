@@ -3,8 +3,10 @@
 from orders_service.application import dtos, entities, errors, interfaces
 
 
-class Customer:
+class Customer(interfaces.Customer):
     """Сценарии клиента; каждый публичный метод — отдельная транзакция.
+
+    Контракт методов — у порта ``interfaces.Customer``; здесь — как он исполняется.
 
     Attributes:
         uow_factory: Вызываемый объект, создающий новый Unit of Work на каждый вызов метода.
@@ -19,18 +21,13 @@ class Customer:
         self.uow_factory = uow_factory
 
     async def add(self, new_customer_info: dtos.NewCustomerInfo) -> dtos.Customer:
-        """Регистрирует клиента.
+        """Регистрирует клиента: предварительная проверка email, затем запись и commit.
 
         Args:
             new_customer_info: Имя и email нового клиента.
 
         Returns:
             Зарегистрированный клиент с идентификатором.
-
-        Raises:
-            CustomerAlreadyExists: Email уже занят — по предварительной проверке либо по
-                ограничению уникальности хранилища при одновременной регистрации.
-            StorageUnavailable: Временный сбой хранилища.
         """
         async with self.uow_factory() as uow:
             if await uow.customers.fetch_by_email(new_customer_info.email) is not None:
@@ -41,17 +38,13 @@ class Customer:
             return dtos.Customer.model_validate(added)
 
     async def get(self, customer_id: int) -> dtos.Customer:
-        """Возвращает клиента по идентификатору.
+        """Возвращает клиента по идентификатору; чтение без commit.
 
         Args:
             customer_id: Идентификатор клиента.
 
         Returns:
             Найденный клиент.
-
-        Raises:
-            CustomerNotFound: Клиента с таким идентификатором нет.
-            StorageUnavailable: Временный сбой хранилища.
         """
         async with self.uow_factory() as uow:
             customer = await uow.customers.fetch_by_id(customer_id)

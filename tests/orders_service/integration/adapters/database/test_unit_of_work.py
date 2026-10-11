@@ -9,9 +9,13 @@ import logging
 from decimal import Decimal
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from orders_service.adapters import tracing
 from orders_service.adapters.database import tables
 from orders_service.application import dtos, entities, errors, interfaces, services
 
@@ -395,3 +399,60 @@ class TestCommit:
         # Assert: одна DEBUG-запись адаптера на фиксацию
         records = [record for record in caplog.records if record.name == UOW_LOGGER]
         assert [record.levelno for record in records] == [logging.DEBUG]
+
+
+class TestSpan:
+    async def test__nested_enter_rejected_keeps_outer_usable(
+        self,
+        traced_uow_factory: interfaces.UnitOfWorkFactory,
+        fill_db: dict[str, list[int]],
+        spans: InMemorySpanExporter,
+    ) -> None:
+        # Setup
+        mug_id: int = fill_db["product_ids"][0]
+        spans.clear()
+
+        # Call: вложенный вход отвергается, внешняя единица работы продолжает работать
+        async with traced_uow_factory() as uow:
+            with pytest.raises(RuntimeError):
+                async with uow:
+                    pass
+            await uow.products.fetch_by_id(mug_id)
+            await uow.commit()
+
+        # Assert: два спана unit_of_work — вложенный с ошибкой, внешний зафиксирован
+        nested, outer = [span for span in spans.get_finished_spans() if span.name == "unit_of_work"]
+        assert nested.status.status_code is StatusCode.ERROR
+        assert outer.status.status_code is StatusCode.UNSET
+        assert outer.attributes is not None
+        assert outer.attributes[tracing.OUTCOME_ATTRIBUTE] == "committed"
+        assert not trace.get_current_span().get_span_context().is_valid
+
+    async def test__lost_connection_on_commit(
+        self,
+        traced_uow_factory: interfaces.UnitOfWorkFactory,
+        create_test_db: AsyncEngine,
+        fill_db: dict[str, list[int]],
+        spans: InMemorySpanExporter,
+    ) -> None:
+        # Setup
+        mug_id: int = fill_db["product_ids"][0]
+        spans.clear()
+
+        # Call
+        with pytest.raises(errors.StorageUnavailable):
+            async with traced_uow_factory() as uow:
+                (product,) = await uow.products.fetch_by_ids([mug_id], for_update=True)
+                product.reserve(1)
+                await _terminate_other_backends(create_test_db)
+                await uow.commit()
+
+        # Assert: исход — откат, в спане исходный сбой соединения, контекст снят
+        (span,) = [span for span in spans.get_finished_spans() if span.name == "unit_of_work"]
+        assert span.attributes is not None
+        assert span.attributes[tracing.OUTCOME_ATTRIBUTE] == "rolled_back"
+        assert span.status.status_code is StatusCode.ERROR
+        (event,) = span.events
+        assert event.attributes is not None
+        assert "InterfaceError" in str(event.attributes["exception.type"])
+        assert not trace.get_current_span().get_span_context().is_valid

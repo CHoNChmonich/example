@@ -1,26 +1,27 @@
-"""Конфигурация ``logging``: один хендлер в stdout, формат по настройкам, фильтр request id."""
+"""Конфигурация ``logging``: один хендлер в stdout, формат по настройкам, фильтр контекста."""
 
 import logging.config
 from collections.abc import Mapping
 from typing import Any
 
-from .context import RequestIdFilter
+from .context import LogContextFilter
 from .settings import Settings
 
 JSON_FORMATTER = "pythonjsonlogger.json.JsonFormatter"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
-_TEXT_FORMAT = "%(asctime)s %(levelname)-8s [%(name)s] [%(request_id)s] %(message)s"
+_TEXT_FORMAT = "%(asctime)s %(levelname)-8s [%(name)s] [%(trace_id)s] %(message)s"
 _JSON_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 
 
-def make_config(settings: Settings, levels: Mapping[str, str]) -> dict[str, Any]:
-    """Собирает dictConfig: хендлер в stdout, форматтер по ``LOG_FORMAT``, фильтр request id.
+def _make_config(settings: Settings, levels: Mapping[str, str]) -> dict[str, Any]:
+    """Собирает dictConfig: хендлер в stdout, форматтер по ``LOG_FORMAT``, фильтр контекста.
 
     Логгеры из ``levels`` получают уровень, лишаются собственных хендлеров и уходят в корень
     (``propagate``): так сторонние библиотеки пишут нашим форматом; ``NOTSET`` означает
     «наследовать уровень корня». Ранее созданные логгеры не отключаются. JSON-форматтер
-    добавляет ``request_id`` сам (python-json-logger включает в объект нестандартные
-    атрибуты записи) и не экранирует кириллицу — сырой лог остаётся читаемым.
+    добавляет поля контекста (``trace_id``, ``span_id``) сам: python-json-logger
+    включает в объект нестандартные атрибуты записи; кириллица не экранируется — сырой лог
+    остаётся читаемым.
 
     Args:
         settings: Уровень и формат.
@@ -38,14 +39,14 @@ def make_config(settings: Settings, levels: Mapping[str, str]) -> dict[str, Any]
     return {
         "version": 1,
         "disable_existing_loggers": False,
-        "filters": {"request_id": {"()": RequestIdFilter}},
+        "filters": {"context": {"()": LogContextFilter}},
         "formatters": {"default": formatter},
         "handlers": {
             "stdout": {
                 "class": "logging.StreamHandler",
                 "stream": "ext://sys.stdout",
                 "formatter": "default",
-                "filters": ["request_id"],
+                "filters": ["context"],
             }
         },
         "root": {"level": settings.LOG_LEVEL, "handlers": ["stdout"]},
@@ -61,6 +62,6 @@ def configure(settings: Settings, *, levels: Mapping[str, str]) -> None:
 
     Args:
         settings: Уровень и формат.
-        levels: Уровни сторонних логгеров по имени (см. ``make_config``).
+        levels: Уровни сторонних логгеров по имени (см. ``_make_config``).
     """
-    logging.config.dictConfig(make_config(settings, levels))
+    logging.config.dictConfig(_make_config(settings, levels))

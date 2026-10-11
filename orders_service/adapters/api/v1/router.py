@@ -10,6 +10,9 @@ from fastapi import APIRouter
 from orders_service.adapters.api.dtos import ErrorResponse
 from orders_service.adapters.api.v1.controller import Controller
 
+# Путь служебной проверки под префиксом v1; по нему же create_app исключает её из трассы.
+HEALTHCHECK_PATH = "/healthcheck"
+
 
 def create_router(controller: Controller, *, prefix: str = "/api/v1") -> APIRouter:
     """Объявляет маршруты v1 поверх методов контроллера.
@@ -132,7 +135,7 @@ def create_router(controller: Controller, *, prefix: str = "/api/v1") -> APIRout
         responses=not_found_responses,
     )
     router.add_api_route(
-        "/healthcheck",
+        HEALTHCHECK_PATH,
         controller.healthcheck,
         methods=["GET"],
         include_in_schema=False,

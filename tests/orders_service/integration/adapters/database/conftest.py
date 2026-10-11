@@ -22,8 +22,10 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import NullPool
 
-from orders_service.adapters import database  # импорт пакета регистрирует маппинг
+from orders_service.adapters import database, tracing  # импорт пакета регистрирует маппинг
 from orders_service.application import interfaces
+
+POOL_TIMEOUT = 15  # секунд; защищает тест ожидания слота пула от зависания
 
 
 class DatabaseTestSettings(database.Settings):
@@ -44,6 +46,7 @@ def test_database_url() -> str:
 async def create_test_db(test_database_url: str) -> AsyncIterator[AsyncEngine]:
     # Создаём схему тестовой БД и возвращаем движок для использования в тестах
     engine = create_async_engine(test_database_url, poolclass=NullPool)
+    database.spans.instrument(engine)  # как у движка приложения: SQL-спаны в трассе
     async with engine.begin() as connection:
         await connection.run_sync(database.metadata.drop_all)
         await connection.run_sync(database.metadata.create_all)
@@ -77,3 +80,34 @@ def uow_factory(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> interfaces.UnitOfWorkFactory:
     return partial(database.UnitOfWork, session_factory)
+
+
+@pytest.fixture(scope="function")
+def traced_uow_factory(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> interfaces.UnitOfWorkFactory:
+    # Как в composition root: декоратор трассировки над UoW адаптера БД
+    def factory() -> interfaces.UnitOfWork:
+        return tracing.TracedUnitOfWork(database.UnitOfWork(session_factory))
+
+    return factory
+
+
+@pytest.fixture(scope="function")
+async def traced_pool_engine(
+    test_database_url: str, create_test_db: AsyncEngine
+) -> AsyncIterator[AsyncEngine]:
+    # Движок приложения в миниатюре: TracedPool на один слот без переполнения, чтобы ожидание
+    # соединения было видно; пул освобождается до удаления схемы (зависимость от create_test_db)
+    engine = create_async_engine(
+        test_database_url,
+        poolclass=database.spans.TracedPool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=POOL_TIMEOUT,
+    )
+    database.spans.instrument(engine)
+
+    yield engine
+
+    await engine.dispose()

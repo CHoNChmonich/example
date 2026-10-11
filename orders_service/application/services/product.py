@@ -3,8 +3,10 @@
 from orders_service.application import dtos, entities, errors, interfaces
 
 
-class Product:
+class Product(interfaces.Product):
     """Сценарии товара; каждый публичный метод — отдельная транзакция.
+
+    Контракт методов — у порта ``interfaces.Product``; здесь — как он исполняется.
 
     Attributes:
         uow_factory: Вызываемый объект, создающий новый Unit of Work на каждый вызов метода.
@@ -19,16 +21,13 @@ class Product:
         self.uow_factory = uow_factory
 
     async def add(self, new_product_info: dtos.NewProductInfo) -> dtos.Product:
-        """Добавляет товар с начальным остатком.
+        """Добавляет товар с начальным остатком: запись и commit.
 
         Args:
             new_product_info: Название, цена и начальный остаток.
 
         Returns:
             Добавленный товар с идентификатором.
-
-        Raises:
-            StorageUnavailable: Временный сбой хранилища.
         """
         async with self.uow_factory() as uow:
             product = entities.Product(
@@ -41,17 +40,13 @@ class Product:
             return dtos.Product.model_validate(added)
 
     async def get(self, product_id: int) -> dtos.Product:
-        """Возвращает товар по идентификатору.
+        """Возвращает товар по идентификатору; чтение без commit.
 
         Args:
             product_id: Идентификатор товара.
 
         Returns:
             Найденный товар.
-
-        Raises:
-            ProductNotFound: Товара с таким идентификатором нет.
-            StorageUnavailable: Временный сбой хранилища.
         """
         async with self.uow_factory() as uow:
             product = await uow.products.fetch_by_id(product_id)

@@ -1,6 +1,6 @@
 """API v1: контроллер и фабрика маршрутизатора."""
 
 from .controller import Controller
-from .router import create_router
+from .router import HEALTHCHECK_PATH, create_router
 
-__all__ = ["Controller", "create_router"]
+__all__ = ["HEALTHCHECK_PATH", "Controller", "create_router"]

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import AsyncAdaptedQueuePool, Pool
 
 from .settings import Settings
 
@@ -19,21 +20,32 @@ class Database:
             к сущностям можно обращаться без новых запросов.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, poolclass: type[Pool] = AsyncAdaptedQueuePool) -> None:
         """Создаёт движок и фабрику сессий; соединения открываются лениво.
 
         Пул создаётся с ``pool_pre_ping``: мёртвое простаивающее соединение проверяется
         до выдачи из пула, а не на первом запросе транзакции. SQL-лог включается не флагом
-        ``echo`` движка, а уровнем логгера (см. ``logger_levels``).
+        ``echo`` движка, а уровнем логгера (см. ``logger_levels``). О трассировке класс не
+        знает: класс пула (например, ``spans.TracedPool``) и слушатели SQL-спанов для
+        ``engine`` задаёт composition root.
 
         Args:
             settings: Параметры подключения к PostgreSQL.
+            poolclass: Класс пула соединений; по умолчанию тот, что SQLAlchemy выбирает для
+                async-движка сам.
         """
         self._settings = settings
-        self._engine: AsyncEngine = create_async_engine(settings.database_url, pool_pre_ping=True)
+        self._engine: AsyncEngine = create_async_engine(
+            settings.database_url, pool_pre_ping=True, poolclass=poolclass
+        )
         self.session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
             self._engine, expire_on_commit=False
         )
+
+    @property
+    def engine(self) -> AsyncEngine:
+        """Движок — для инструментирования из composition root."""
+        return self._engine
 
     async def aopen(self) -> None:
         """Проверяет доступность БД на старте: ошибка конфигурации — ошибка запуска.

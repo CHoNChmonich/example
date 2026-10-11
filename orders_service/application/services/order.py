@@ -5,11 +5,12 @@ from collections.abc import Mapping
 from orders_service.application import dtos, entities, errors, interfaces
 
 
-class Order:
+class Order(interfaces.Order):
     """Сценарии заказа; каждый публичный метод — отдельная транзакция.
 
     Оформление и отмена — многорепозиторные транзакции (клиенты, товары, заказы в одном
-    Unit of Work): остатки и заказ меняются атомарно либо не меняются вовсе.
+    Unit of Work): остатки и заказ меняются атомарно либо не меняются вовсе. Контракт
+    методов — у порта ``interfaces.Order``; здесь — как он исполняется.
 
     Attributes:
         uow_factory: Вызываемый объект, создающий новый Unit of Work на каждый вызов метода.
@@ -31,20 +32,16 @@ class Order:
         self.discount_policy = discount_policy
 
     async def place(self, new_order_info: dtos.NewOrderInfo) -> dtos.Order:
-        """Оформляет заказ: проверяет клиента и товары, резервирует остатки, применяет скидку.
+        """Оформляет заказ: товары блокируются ``FOR UPDATE`` в порядке идентификаторов.
+
+        Резервирование остатков, скидка и запись заказа — в одной транзакции; ошибка на любой
+        строке откатывает всё.
 
         Args:
             new_order_info: Клиент и строки заказа.
 
         Returns:
             Сохранённый заказ со строками, скидкой и суммой к оплате.
-
-        Raises:
-            CustomerNotFound: Клиента с таким идентификатором нет.
-            ProductNotFound: Какого-то из товаров нет; называется первый отсутствующий
-                в порядке строк заказа.
-            InsufficientStock: Остатка товара не хватает; ничего не сохраняется.
-            StorageUnavailable: Временный сбой хранилища.
         """
         async with self.uow_factory() as uow:
             if await uow.customers.fetch_by_id(new_order_info.customer_id) is None:
@@ -70,17 +67,13 @@ class Order:
             return dtos.Order.model_validate(added)
 
     async def get(self, order_id: int) -> dtos.Order:
-        """Возвращает заказ по идентификатору.
+        """Возвращает заказ по идентификатору; чтение без commit.
 
         Args:
             order_id: Идентификатор заказа.
 
         Returns:
             Найденный заказ со строками.
-
-        Raises:
-            OrderNotFound: Заказа с таким идентификатором нет.
-            StorageUnavailable: Временный сбой хранилища.
         """
         async with self.uow_factory() as uow:
             order = await uow.orders.fetch_by_id(order_id)
@@ -89,34 +82,26 @@ class Order:
             return dtos.Order.model_validate(order)
 
     async def find(self, filter_params: dtos.FindOrders) -> list[dtos.Order]:
-        """Находит заказы по фильтру.
+        """Находит заказы по фильтру; чтение без commit.
 
         Args:
             filter_params: Клиент, статус, лимит и смещение выборки.
 
         Returns:
             Заказы по возрастанию идентификатора; пустой список, если ничего не найдено.
-
-        Raises:
-            StorageUnavailable: Временный сбой хранилища.
         """
         async with self.uow_factory() as uow:
             orders = await uow.orders.fetch_all(filter_params)
             return [dtos.Order.model_validate(order) for order in orders]
 
     async def pay(self, order_id: int) -> dtos.Order:
-        """Оплачивает заказ.
+        """Оплачивает заказ: строка заказа блокируется ``FOR UPDATE`` на время перехода.
 
         Args:
             order_id: Идентификатор заказа.
 
         Returns:
             Заказ в статусе ``paid``.
-
-        Raises:
-            OrderNotFound: Заказа с таким идентификатором нет.
-            OrderTransitionNotAllowed: Заказ уже оплачен или отменён.
-            StorageUnavailable: Временный сбой хранилища.
         """
         async with self.uow_factory() as uow:
             order = await uow.orders.fetch_by_id(order_id, for_update=True)
@@ -127,20 +112,13 @@ class Order:
             return dtos.Order.model_validate(order)
 
     async def cancel(self, order_id: int) -> dtos.Order:
-        """Отменяет заказ и возвращает остатки на склад.
+        """Отменяет заказ: блокирует строку заказа, затем товары, и возвращает остатки.
 
         Args:
             order_id: Идентификатор заказа.
 
         Returns:
             Заказ в статусе ``cancelled``.
-
-        Raises:
-            OrderNotFound: Заказа с таким идентификатором нет.
-            OrderTransitionNotAllowed: Заказ уже оплачен или отменён.
-            ProductNotFound: Товар строки заказа исчез из хранилища (невозможно при
-                внешнем ключе, страховка).
-            StorageUnavailable: Временный сбой хранилища.
         """
         async with self.uow_factory() as uow:
             order = await uow.orders.fetch_by_id(order_id, for_update=True)

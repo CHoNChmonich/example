@@ -1,21 +1,22 @@
-"""Контекст записей лога: идентификатор запроса, общий для всех записей одной единицы работы."""
+"""Контекст записей лога: идентификаторы трассы текущего спана."""
 
 import logging
-from contextvars import ContextVar
 
-# Ставит входящий адаптер на время запроса, читает RequestIdFilter; вне запроса — None.
-request_id: ContextVar[str | None] = ContextVar("request_id", default=None)
+from opentelemetry import trace
 
 
-class RequestIdFilter(logging.Filter):
-    """Дописывает в запись ``request_id`` из контекста (``-``, если контекста нет).
+class LogContextFilter(logging.Filter):
+    """Дописывает в запись ``trace_id`` и ``span_id`` текущего спана (``-``, если спана нет).
 
-    Вешается на хендлер, а не на логгер: так обогащаются и записи, пришедшие по ``propagate``
-    из чужих логгеров (``uvicorn.access``, ``sqlalchemy.engine``).
+    Идентификаторы читаются у фасада ``opentelemetry.trace``: без провайдера спан
+    недействителен, и в записи остаётся ``-``. Фильтр вешается на хендлер, а не на логгер:
+    так обогащаются и записи, пришедшие по ``propagate`` из чужих логгеров
+    (``uvicorn.access``, ``sqlalchemy.engine``). Отдельного идентификатора запроса нет:
+    запрос, транзакцию и SQL связывает ``trace_id``.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        """Добавляет атрибут и пропускает запись.
+        """Добавляет атрибуты и пропускает запись.
 
         Args:
             record: Запись лога.
@@ -23,5 +24,8 @@ class RequestIdFilter(logging.Filter):
         Returns:
             Всегда ``True``: фильтр только обогащает.
         """
-        record.__dict__["request_id"] = request_id.get() or "-"
+        span_context = trace.get_current_span().get_span_context()
+        valid = span_context.is_valid
+        record.__dict__["trace_id"] = trace.format_trace_id(span_context.trace_id) if valid else "-"
+        record.__dict__["span_id"] = trace.format_span_id(span_context.span_id) if valid else "-"
         return True

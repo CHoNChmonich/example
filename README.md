@@ -11,8 +11,8 @@ uv, docker compose. Код, комментарии и документация �
 и классов.
 
 Образцы, по которым построен проект: слои и правила слоёв — учебный репозиторий `hex_arch`;
-устройство HTTP-адаптера и composition root — сервис `interactive_panels`. История
-проектирования (план, кросс-ревью, принятые и отклонённые решения) — `docs/plan.md`.
+устройство HTTP-адаптера и composition root — сервис `interactive_panels`. Действующие
+правила — этот README и докстринги.
 
 ---
 
@@ -109,18 +109,19 @@ curl -s "$API/orders?customer_id=1&status=paid"                          # 200, 
 ```mermaid
 flowchart LR
     subgraph launchers["launchers — composition root"]
-        API_L["api.py<br/>Settings → Logger → Adapters → Application → Controllers"]
+        API_L["api.py<br/>Settings → Logger → Tracing → Adapters → Application → Decorators → Controllers"]
         ALEMBIC["alembic_runner.py"]
         CONFIG["config.py"]
     end
     subgraph adapters["adapters"]
-        API["api — FastAPI<br/>create_app · Controller · create_router · error_handlers · request_id"]
-        DB["database — SQLAlchemy<br/>UnitOfWork · репозитории · tables · mapping · alembic"]
-        LOG["log — конфигурация logging<br/>Settings · make_config · configure · request_id"]
+        API["api — FastAPI<br/>create_app · Controller · create_router · error_handlers"]
+        DB["database — SQLAlchemy<br/>UnitOfWork · репозитории · spans (SQL, TracedPool) · tables · mapping · alembic"]
+        LOG["log — конфигурация logging<br/>Settings · configure · LogContextFilter"]
+        TRACING["tracing — OpenTelemetry<br/>Settings · configure · span<br/>TracedUnitOfWork · TracedCustomer · TracedProduct · TracedOrder"]
     end
     subgraph application["application — ядро"]
         SERVICES["services<br/>Customer · Product · Order"]
-        INTERFACES["interfaces (порты)<br/>CustomersRepo · ProductsRepo · OrdersRepo<br/>UnitOfWork · UnitOfWorkFactory = Callable[[], UnitOfWork]"]
+        INTERFACES["interfaces (порты)<br/>входящие: Customer · Product · Order<br/>исходящие: CustomersRepo · ProductsRepo · OrdersRepo · UnitOfWork"]
         ENTITIES["entities (домен)<br/>Customer · Product · Order · OrderLine<br/>DiscountPolicy · состояния заказа"]
         DTOS["dtos"]
         ERRORS["errors"]
@@ -130,10 +131,13 @@ flowchart LR
     API_L --> SERVICES
     ALEMBIC --> DB
     API_L --> LOG
+    API_L --> TRACING
     ALEMBIC --> LOG
-    API -. request_id .-> LOG
-    API --> SERVICES
-    DB -. реализует .-> INTERFACES
+    DB -. span .-> TRACING
+    API --> INTERFACES
+    DB -. реализует исходящие .-> INTERFACES
+    TRACING -. реализует (Decorator) .-> INTERFACES
+    SERVICES -. реализует входящие .-> INTERFACES
     SERVICES --> INTERFACES
     SERVICES --> ENTITIES
     SERVICES --> DTOS
@@ -142,10 +146,11 @@ flowchart LR
 
 | Слой | Что внутри | Правила |
 |---|---|---|
-| `application/` | `entities.py` — весь домен; `services/` — сервис на сущность с набором методов; `interfaces/` — ABC только для **исходящих** портов; `dtos/` — Pydantic-модели входа/выхода и параметры поиска; `errors.py` | Между слоями передаются DTO и сущности, не `dict`/`list`. Входящих портов нет: контроллер зависит от конкретных `services.X` |
-| `adapters/api/` | `create_app`, `create_lifespan`, `error_handlers`, `request_id` (middleware корреляции), `v1/controller.py`, `v1/router.py`, `v1/schemas` (`*Body.to_application()`), `v1/dtos` (`*Response.from_application()`) | **Обработчики — методы класса `Controller`, сервисы приходят в его конструктор. FastAPI-`Depends` не используется нигде.** `Path/Query/Body` — разбор запроса, не DI. Маршруты объявляются императивно (`add_api_route`) |
-| `adapters/database/` | `settings`, `database` (движок и фабрика сессий), `tables`, `mapping` (императивный маппинг dataclass-сущностей), `repositories/`, `unit_of_work`, `alembic/`, `migrations/` | Реализации портов носят имена портов и различаются модулем: `interfaces.OrdersRepo` / `database.repositories.OrdersRepo` |
-| `adapters/log/` | `settings` (`LOG_LEVEL`, `LOG_FORMAT`), `config` (`make_config`, `configure`), `context` (`request_id`, `RequestIdFilter`) | Инфраструктура без порта: любой слой пишет через `logging.getLogger(__name__)`, хендлеры и формат задаются здесь, применяет composition root; другие адаптеры могут импортировать `log` как библиотеку, обратных зависимостей нет |
+| `application/` | `entities.py` — весь домен; `services/` — сервис на сущность с набором методов; `interfaces/` — ABC портов: **входящие** (`Customer`, `Product`, `Order` — сценарии) и **исходящие** (`*Repo`, `UnitOfWork`); `dtos/` — Pydantic-модели входа/выхода и параметры поиска; `errors.py` | Между слоями передаются DTO и сущности, не `dict`/`list`. Сервисы реализуют входящие порты; контроллер и декораторы зависят от портов, а не от `services.X` |
+| `adapters/api/` | `create_app`, `create_lifespan`, `error_handlers`, `v1/controller.py`, `v1/router.py`, `v1/schemas` (`*Body.to_application()`), `v1/dtos` (`*Response.from_application()`) | **Обработчики — методы класса `Controller`, порты сценариев приходят в его конструктор. FastAPI-`Depends` не используется нигде.** `Path/Query/Body` — разбор запроса, не DI. Маршруты объявляются императивно (`add_api_route`) |
+| `adapters/database/` | `settings`, `database` (движок и фабрика сессий), `tables`, `mapping` (императивный маппинг dataclass-сущностей), `repositories/`, `unit_of_work`, `spans` (спаны SQL и `TracedPool`), `alembic/`, `migrations/` | Реализации портов носят имена портов и различаются модулем: `interfaces.OrdersRepo` / `database.repositories.OrdersRepo`. `UnitOfWork` и `Database` о трассировке не знают: класс пула и слушатели SQL задаёт composition root |
+| `adapters/log/` | `settings` (`LOG_LEVEL`, `LOG_FORMAT`), `config` (`configure`; сборка `dictConfig` — приватная), `context` (`LogContextFilter`: `trace_id`, `span_id`) | Инфраструктура без порта: любой слой пишет через `logging.getLogger(__name__)`, хендлеры и формат задаются здесь, применяет composition root; зависимостей на другие адаптеры нет |
+| `adapters/tracing/` | `settings` (`TRACING_EXPORTER`, endpoint, имя сервиса), `config` (`configure`, `shutdown`; сборщики ресурса, сэмплера, процессора и провайдера — приватные), `spans` (контекстный менеджер `span` с политикой исхода), `unit_of_work` (`TracedUnitOfWork`), `services` (`TracedCustomer`, `TracedProduct`, `TracedOrder`) | Конфигурация SDK плюс декораторы над портами ядра (GoF Decorator): спаны сценариев и единицы работы добавляются без правки сервисов и адаптера БД; `database` импортирует `tracing.span` как библиотеку, обратных импортов нет; ядро о трассировке не знает |
 | `launchers/` | `api.py` — composition root HTTP-сервиса; `alembic_runner.py` — миграции; `config.py` — настройки уровня приложения | Граф собирается вручную в классах-неймспейсах при импорте модуля; все адаптеры и сервисы — синглтоны процесса |
 
 ---
@@ -156,19 +161,22 @@ flowchart LR
 sequenceDiagram
     participant C as Клиент
     participant R as router / Controller.place_order
+    participant T as tracing.TracedOrder
     participant S as services.Order.place
+    participant W as tracing.TracedUnitOfWork
     participant U as database.UnitOfWork
     participant E as entities
-    C->>R: POST /api/v1/orders (OrderCreateBody)
-    R->>S: place(dtos.NewOrderInfo)
-    S->>U: self.uow_factory() → async with … as uow
-    U->>U: __aenter__: session_factory() + репозитории на сессии
-    S->>U: customers.fetch_by_id
-    S->>U: products.fetch_by_ids(for_update=True)
+    C->>R: POST /api/v1/orders (OrderCreateBody) — спан запроса (FastAPI)
+    R->>T: place(dtos.NewOrderInfo)
+    T->>S: place(...) под спаном Order.place
+    S->>W: self.uow_factory() → async with … as uow
+    W->>U: __aenter__ под спаном unit_of_work: session_factory() + репозитории
+    S->>U: customers.fetch_by_id — pool.connect (TracedPool), затем SELECT
+    S->>U: products.fetch_by_ids(for_update=True) — SELECT … FOR UPDATE
     S->>E: product.reserve(qty) · Order(...) · order.apply_discount(policy)
     S->>U: orders.add(order) → flush
-    S->>U: commit()
-    S->>U: __aexit__ → rollback (холостой), close
+    S->>W: commit() → U.commit(); outcome = committed
+    S->>W: __aexit__ → U.__aexit__ (rollback холостой, close); спан закрыт
     S-->>R: dtos.Order (собран внутри контекста)
     R-->>C: 201 OrderResponse
 ```
@@ -183,9 +191,10 @@ sequenceDiagram
   `await uow.commit()`, чтения commit не вызывают.
 - **Новый UoW на каждый вызов.** `uow_factory` — любой вызываемый объект без аргументов,
   возвращающий `interfaces.UnitOfWork` (тип `interfaces.UnitOfWorkFactory`); composition root
-  передаёт `functools.partial(database.UnitOfWork, db.session_factory)`. Сессию и репозитории
+  передаёт `Adapters.uow_factory` — статический метод, отдающий
+  `tracing.TracedUnitOfWork(database.UnitOfWork(db.session_factory))`. Сессию и репозитории
   `database.UnitOfWork` создаёт сам в `__aenter__` — это и есть «UoW и репозитории создаются
-  прямо в сервисе при вызове». Сервисы — синглтоны, запросы конкурентны, поэтому сессия не
+  прямо в сервисе при вызове»; декоратор лишь добавляет спан. Сервисы — синглтоны, запросы конкурентны, поэтому сессия не
   может жить ни в `self` сервиса, ни в одном общем UoW.
 - **Без commit — откат.** `__aexit__` всегда откатывает незакоммиченное, закрывает сессию и
   удаляет репозитории: исключение из метода или забытый commit не оставляют частичных
@@ -216,30 +225,102 @@ sequenceDiagram
 
 - **Где настраивается.** `adapters/log` — конфигурация `logging`, не адаптер порта: любой слой
   пишет через `logging.getLogger(__name__)` и не знает о хендлерах. `log.Settings`
-  (`LOG_LEVEL`, `LOG_FORMAT=text|json`) и `make_config` задают один хендлер в stdout, а
-  composition root (`launchers/api.py`, `alembic_runner.py`) вызывает `log.configure`.
+  (`LOG_LEVEL`, `LOG_FORMAT=text|json`) и `log.configure` задают один хендлер в stdout; вызывает
+  его composition root (`launchers/api.py`, `alembic_runner.py`).
 - **Чужие логгеры — в общий хендлер.** `database.logger_levels(settings)` даёт уровень
   `sqlalchemy.engine` (INFO при `POSTGRES_ECHO_SQL`, иначе WARNING) — вместо `echo=True`
   движка, который вешает собственный хендлер и дублирует строки. Имена логгеров uvicorn живут
   в launcher (`UVICORN_LOGGERS`, уровень `NOTSET` — наследовать `LOG_LEVEL`): `LOG_LEVEL=WARNING`
   глушит access-лог. Ранее созданные логгеры не отключаются (`disable_existing_loggers=False`).
-- **Корреляция запросов.** `RequestIdMiddleware` (`adapters/api/request_id.py`) принимает
-  `X-Request-ID` (`[A-Za-z0-9._-]{1,64}`) или генерирует uuid4, ставит contextvar
-  `log.request_id` на время запроса и возвращает заголовок в ответе; `RequestIdFilter` на
-  хендлере дописывает `request_id` в каждую запись, включая `uvicorn.access` и SQL. Middleware
-  стоит снаружи всего стека (`App.build_middleware_stack`), поэтому заголовок есть и у 500.
+- **Корреляция запросов — `trace_id`.** Отдельного идентификатора запроса (`X-Request-ID`)
+  нет: его роль играет `trace_id` серверного спана. `LogContextFilter` на хендлере дописывает
+  `trace_id` и `span_id` текущего спана в каждую запись, включая `uvicorn.access` (пишется
+  внутри вызова приложения, пока спан открыт) и SQL. Клиент, которому нужна сквозная
+  корреляция, передаёт `traceparent` (W3C) — тот же `trace_id` окажется в логах и в трассе;
+  без заголовка сервер генерирует его сам. `healthcheck` из трассы исключён, у его строк `-`.
   Ограничение: трассировку необработанного исключения uvicorn пишет после выхода из
   приложения — без id, рядом со строкой access-лога, где id есть.
 - **Что логирует ядро.** Ничего: сервис не знает об исходе фиксации. `database.UnitOfWork.commit`
   пишет DEBUG «Транзакция зафиксирована», обработчик ошибок — WARNING на 503 и ничего на
   4xx/500 (трассировку 500 пишет сервер).
-- **Формат.** `text`: `2026-10-10 12:00:00 INFO     [orders_service…] [<request_id>] …`;
+- **Формат.** `text`: `2026-10-10 12:00:00 INFO     [orders_service…] [<trace_id>] …`;
   `json` (python-json-logger): объект на строку с `asctime`, `levelname`, `name`, `message`,
-  `request_id`. Две-три строки master-процесса uvicorn остаются в его формате; `--log-level`
+  `trace_id`, `span_id`. Две-три строки master-процесса uvicorn остаются в его формате; `--log-level`
   в entrypoint влияет только на них.
 - `logging` сам построен на Observer (хендлеры), Strategy (форматтер) и Chain of Responsibility
   (иерархия логгеров, фильтры); адаптер их только конфигурирует, в таблицу паттернов они не
   добавлены.
+
+---
+
+## Трассировка
+
+- **Ядро о трассировке не знает.** Ни порта трассировки, ни внедрения в сервисы. Спаны
+  добавляют **декораторы над портами** (GoF Decorator), которые composition root ставит между
+  контроллером и сервисами и между сервисами и UoW адаптера БД; сами `services.X`,
+  `database.UnitOfWork` и `Database` трассировки не содержат. OpenTelemetry API — фасад с no-op
+  по умолчанию: без провайдера спаны не записываются, в логах `trace_id` равен `-`.
+  Конфигурация — в `adapters/tracing`: `configure` собирает провайдер (экспортёр по
+  `TRACING_EXPORTER`, сэмплер, ресурс — приватные сборщики модуля `config`) и ставит
+  его глобально (один раз на процесс), `shutdown` досылает спаны при остановке
+  (cleanup lifespan).
+- **Сэмплирование и ресурс.** `TRACING_SAMPLE_RATIO` (0..1, по умолчанию 1) — доля
+  записываемых корневых трасс: `ParentBased(TraceIdRatioBased)`, то есть спан с родителем
+  наследует его решение (входящий `traceparent` с флагом sampled записывается целиком), а
+  корневой решает сам по `trace_id`, поэтому трасса записана либо на всех сервисах, либо
+  нигде. У незаписанной трассы контекст с `trace_id` всё равно есть — логи корреляцию не
+  теряют. Ресурс спанов: `service.name`, `service.version` (по умолчанию версия пакета),
+  `deployment.environment` (`TRACING_ENVIRONMENT`), `service.instance.id`
+  (`TRACING_SERVICE_INSTANCE_ID`, по умолчанию hostname — в контейнере его id или имя пода);
+  без них трассы разных релизов, стендов и реплик в одном бэкенде неразличимы.
+- **Дерево трассы одного запроса.**
+
+  ```
+  POST /api/v1/orders          FastAPI (App(telemetry=…))
+  └── Order.place              tracing.TracedOrder — Decorator над interfaces.Order
+      └── unit_of_work         tracing.TracedUnitOfWork — Decorator над interfaces.UnitOfWork; outcome
+          ├── pool.connect     database.spans.TracedPool — ожидание соединения; size/checked_in/checked_out
+          ├── SELECT           database.spans — слушатели событий движка; db.*
+          ├── UPDATE
+          └── INSERT
+  ```
+
+  Серверный спан — встроенная телеметрия FastAPI (`App(telemetry=…)` в `create_app`): имя по
+  маршруту, `http.route`, продолжение входящего `traceparent`, статус ERROR при 500; спан
+  открывается до входа в стек middleware, поэтому запрос и спан
+  связывает `trace_id` в строках лога; `healthcheck` исключён по пути с учётом `root_path`,
+  служебные спаны, метрики, логи и автоконфигурация из `OTEL_*` выключены. Спаны сценариев
+  названы `Класс.метод` реализации — низкая кардинальность, совпадает с кодом. Спан
+  `unit_of_work` группирует SQL транзакции; атрибут `orders_service.unit_of_work.outcome` —
+  `committed` или `rolled_back`. Спан `pool.connect` покрывает ожидание свободного слота,
+  `pool_pre_ping` и установку физического соединения: `TracedPool` переопределяет публичный
+  `Pool.connect()` (расширение наследованием, не Decorator — у пула нет порта), класс задаётся
+  движку через `Database(poolclass=…)`. Спаны SQL — собственные слушатели событий движка:
+  готовый инструментор не поддерживает SQLAlchemy 2.1 и патчит библиотеку глобально; слушатели
+  вешает composition root (`spans.instrument(db.engine)`).
+- **Политика исхода — в одном месте.** Контекстный менеджер `tracing.span` поверх
+  `tracer.start_as_current_span` с отключённой стандартной обработкой исключений:
+  `StorageUnavailable` → ERROR с исходной ошибкой хранилища из `__cause__`; другая ошибка ядра
+  (404, 409, 400) → ожидаемый исход, статус не ставится, только атрибут
+  `orders_service.error.code`; прочее исключение → ERROR; отмена задачи (`CancelledError`) →
+  спан завершается без статуса. Все декораторы используют `span` и правило не дублируют;
+  SQL-слушатели — исключение (у них нет лексического блока, любая ошибка SQL инфраструктурная).
+- **Режимы.** `TRACING_EXPORTER=console` (по умолчанию в `.env.example`) — спаны в stdout
+  синхронно, одной JSON-строкой каждый (не ломает `LOG_FORMAT=json`); `none` — спаны строятся и
+  отбрасываются, идентификаторы в логах есть (режим без стека); `otlp` — пакетно по OTLP/HTTP
+  на `TRACING_OTLP_ENDPOINT` (полный URL, по умолчанию `http://localhost:4318/v1/traces`),
+  смотреть в Jaeger или Tempo; без доступного коллектора экспорт повторяет попытки и
+  задерживает остановку на несколько секунд. Стандартные `OTEL_*` поверхностью конфигурации
+  не являются.
+- **Паттерны.** Decorator (GoF) — `TracedUnitOfWork`, `TracedCustomer`, `TracedProduct`,
+  `TracedOrder`: тот же порт, делегирование, добавленный спан. Null Object (no-op провайдер и
+  спан), Observer (`SpanProcessor`, слушатели SQLAlchemy), Strategy (`SpanExporter`) и Facade
+  (`opentelemetry.trace`) живут внутри библиотек; `span` — контекстный менеджер без имени GoF.
+- **Тесты.** Глобальный провайдер ставится один раз в `tests/conftest.py` с экспортёром в
+  памяти (фикстура `spans`); повторная установка игнорируется — так происходит при импорте
+  composition root в `unit/launchers/test_api.py`. Декораторы тестируются на моках портов
+  (`unit/adapters/tracing/`), дерево на реальной БД и ожидание слота пула —
+  `integration/adapters/database/test_spans.py`.
 
 ---
 
@@ -261,18 +342,20 @@ stateDiagram-v2
 
 ## Словарь имён
 
-| Понятие | `entities` | `dtos` (вход / выход) | `services` | `interfaces` → `database` | `api/v1/schemas` → `api/v1/dtos` | `Controller` → `operation_id` |
+| Понятие | `entities` | `dtos` (вход / выход) | входящий порт `interfaces` → `services` → `tracing` | исходящий порт `interfaces` → `database` | `api/v1/schemas` → `api/v1/dtos` | `Controller` → `operation_id` |
 |---|---|---|---|---|---|---|
-| Клиент | `Customer` | `NewCustomerInfo` / `Customer` | `Customer.add/get` | `CustomersRepo` | `CustomerCreateBody` → `CustomerResponse` | `create_customer` → `createCustomer`, `get_customer` → `getCustomerById` |
-| Товар | `Product` (`reserve/release`) | `NewProductInfo` / `Product` | `Product.add/get` | `ProductsRepo` | `ProductCreateBody` → `ProductResponse` | `create_product`, `get_product` |
-| Заказ | `Order` (`apply_discount/pay/cancel`), `OrderLine`, `OrderStatus` | `NewOrderInfo{lines}`, `FindOrders` / `Order{lines}` | `Order.place/get/find/pay/cancel` | `OrdersRepo` | `OrderCreateBody{lines: [OrderLineCreateBody]}`, `OrderStatus` → `OrderResponse`, `OrderListResponse` | `place_order` → `placeOrder`, `get_order`, `list_orders`, `pay_order`, `cancel_order` |
-| Транзакция | — | — | `async with self.uow_factory() as uow`, `uow.commit()` | `UnitOfWork`, `UnitOfWorkFactory` (тип вызываемого объекта) → `database.UnitOfWork` | — | — |
+| Клиент | `Customer` | `NewCustomerInfo` / `Customer` | `Customer.add/get` → `services.Customer` → `TracedCustomer` | `CustomersRepo` | `CustomerCreateBody` → `CustomerResponse` | `create_customer` → `createCustomer`, `get_customer` → `getCustomerById` |
+| Товар | `Product` (`reserve/release`) | `NewProductInfo` / `Product` | `Product.add/get` → `services.Product` → `TracedProduct` | `ProductsRepo` | `ProductCreateBody` → `ProductResponse` | `create_product`, `get_product` |
+| Заказ | `Order` (`apply_discount/pay/cancel`), `OrderLine`, `OrderStatus` | `NewOrderInfo{lines}`, `FindOrders` / `Order{lines}` | `Order.place/get/find/pay/cancel` → `services.Order` → `TracedOrder` | `OrdersRepo` | `OrderCreateBody{lines: [OrderLineCreateBody]}`, `OrderStatus` → `OrderResponse`, `OrderListResponse` | `place_order` → `placeOrder`, `get_order`, `list_orders`, `pay_order`, `cancel_order` |
+| Транзакция | — | — | `async with self.uow_factory() as uow`, `uow.commit()` | `UnitOfWork`, `UnitOfWorkFactory` (тип вызываемого объекта) → `database.UnitOfWork` → `tracing.TracedUnitOfWork` | — | — |
 | Ошибки | — | — | — | `errors.Error` → категории → `CustomerNotFound` … | `api/dtos.py: ErrorResponse` | — |
 
-Правила: одинаковое имя в разных модулях различается модулем импорта; суффиксы `*Body` /
-`*Response` — только на HTTP-краю; `New*Info` — входные DTO ядра; `Find*` — параметры поиска.
-Предметные модули — в единственном числе (`dtos/order.py`), репозитории и их порты — во
-множественном (`interfaces/orders.py`).
+Правила: одинаковое имя в разных модулях различается модулем импорта (`interfaces.Order` —
+порт, `services.Order` — реализация, `entities.Order` — сущность); суффиксы `*Body` /
+`*Response` — только на HTTP-краю; `New*Info` — входные DTO ядра; `Find*` — параметры поиска;
+`Traced*` — декораторы трассировки. Предметные модули — в единственном числе (`dtos/order.py`,
+`interfaces/order.py` — входящий порт), репозитории и их порты — во множественном
+(`interfaces/orders.py`).
 
 ---
 
@@ -281,10 +364,10 @@ stateDiagram-v2
 | Принцип | Где видно |
 |---|---|
 | **S** | Сервис — сценарии одной сущности; репозиторий — персистентность одной сущности; UoW — граница транзакции; `Controller` — перевод HTTP ↔ DTO; `router.py` — маршрутизация; `error_handlers.py` — ошибки → HTTP |
-| **O** | Новая политика скидки — новый класс `DiscountPolicy` без правки `services.Order`; новый статус — новый класс состояния и строка в `_STATES`; новое хранилище — новая реализация `UnitOfWork` и репозиториев; новая ошибка — наследник категории, адаптер ошибок не меняется |
-| **L** | Любая реализация портов (SQLAlchemy, `Mock(spec=…)` в тестах) подставляется вместо абстракции; все состояния заказа выполняют контракт `_OrderState` |
-| **I** | Три узких порта репозиториев вместо одного универсального; порт `UnitOfWork` без `rollback()`. Сознательный компромисс: один UoW на три репозитория — `services.Customer` получает порт, две трети которого не использует; UoW-порты по агрегатам для трёх сущностей были бы лишними |
-| **D** | `application` зависит только от `interfaces` и доменных абстракций; адаптеры реализуют порты; сборка — в launcher; выбор `VolumeDiscount` и его параметры — в composition root и `.env` |
+| **O** | Новая политика скидки — новый класс `DiscountPolicy` без правки `services.Order`; новый статус — новый класс состояния и строка в `_STATES`; новое хранилище — новая реализация `UnitOfWork` и репозиториев; новая ошибка — наследник категории, адаптер ошибок не меняется; трассировка сценария и единицы работы — Decorator над портом без правки сервиса и адаптера БД |
+| **L** | Любая реализация портов (SQLAlchemy, декоратор трассировки, `Mock(spec=…)` в тестах) подставляется вместо абстракции; все состояния заказа выполняют контракт `_OrderState` |
+| **I** | Три узких порта репозиториев вместо одного универсального; порт `UnitOfWork` без `rollback()`; входящий порт на сущность. Сознательный компромисс: один UoW на три репозитория — `services.Customer` получает порт, две трети которого не использует; UoW-порты по агрегатам для трёх сущностей были бы лишними |
+| **D** | `application` зависит только от `interfaces` и доменных абстракций; `api` зависит от входящих портов, а не от `services.X`; адаптеры реализуют порты; сборка — в launcher; выбор `VolumeDiscount`, его параметры и декораторы трассировки — в composition root и `.env` |
 
 ---
 
@@ -292,10 +375,11 @@ stateDiagram-v2
 
 | Паттерн | Класс / где | Что делает |
 |---|---|---|
-| Фабричная функция (не GoF) | `interfaces.UnitOfWorkFactory = Callable[[], UnitOfWork]`; `functools.partial(database.UnitOfWork, session_factory)` в composition root | Новый UoW на каждый вызов сервиса без класса-фабрики: сессию и репозитории UoW создаёт сам в `__aenter__` |
+| Фабричная функция (не GoF) | `interfaces.UnitOfWorkFactory = Callable[[], UnitOfWork]`; `Adapters.uow_factory` (статический метод) в composition root | Новый UoW на каждый вызов сервиса без класса-фабрики: сессию и репозитории UoW создаёт сам в `__aenter__`, фабрика оборачивает его декоратором трассировки |
 | Strategy (GoF) | `entities.DiscountPolicy`: `NoDiscount`, `VolumeDiscount`; контекст — `Order.apply_discount` | Правило скидки подменяется в composition root, сервис знает только абстракцию |
 | State (GoF) | `entities._OrderState`: `_NewOrderState`, `_FinalOrderState`; `Order.pay/cancel` | Поведение заказа зависит от статуса; недопустимый переход — исключение |
 | Adapter (GoF, в широком смысле) | `adapters/database/repositories`, `database.UnitOfWork` | Приспосабливают `AsyncSession` к контрактам портов ядра |
+| Decorator (GoF) | `tracing.TracedUnitOfWork` над `interfaces.UnitOfWork`; `tracing.TracedCustomer/TracedProduct/TracedOrder` над входящими портами | Тот же порт, делегирование оборачиваемому объекту плюс спан; собираются в composition root (`Adapters.uow_factory`, `Decorators`), сервисы и адаптер БД не меняются |
 | Null Object (не GoF) | `entities.NoDiscount` | Ноль вместо проверки «а есть ли политика» |
 | Repository, Unit of Work, DTO (PoEAA, не GoF) | `interfaces/`, `adapters/database/`, `dtos/` | Персистентность за абстракцией, атомарная единица работы, передача данных между слоями |
 | Composition Root | `launchers/api.py` | Единственное место, где видны все слои |
@@ -354,14 +438,18 @@ ASCII), поэтому вход, который БД не вместит, отк
 3. Адаптер БД: реализация в `adapters/database/repositories/`, таблица в `tables.py`, маппинг в
    `mapping.py`, миграция: `uv run python -m orders_service.launchers.alembic_runner revision
    --autogenerate -m "<slug>" --rev-id 0002`, затем `uv run ruff check --fix` на файле миграции.
-4. Сервис: метод открывает `async with self.uow_factory() as uow:`, запись завершает
-   `await uow.commit()`, DTO собирается внутри контекста.
+4. Сценарий: абстрактный метод с контрактом (`Args`/`Returns`/`Raises`) — во входящий порт
+   `interfaces/<сущность>.py`; реализация в сервисе открывает `async with self.uow_factory()
+   as uow:`, запись завершает `await uow.commit()`, DTO собирается внутри контекста; метод-
+   делегат под `span("Класс.метод")` — в декоратор `tracing/services.py`. Новая сущность —
+   новый порт, сервис и декоратор `Traced*`.
 5. HTTP: `*Body`/`*Response` в `api/v1/schemas` и `api/v1/dtos`, метод `Controller`,
    `add_api_route` в `router.py` с `operation_id`, тегом и картой ответов.
-6. Тесты: unit сервиса на `MagicMock(spec=UnitOfWork)`, HTTP-тест контроллера на
-   `Mock(services.X)`, интеграционный тест репозитория/UoW при новой работе с БД (данные —
-   в `test_data.py`); стиль — как в hex_arch: класс на метод, `# Setup / # Call / # Assert`.
-7. Сборка: новый сервис — в `launchers/api.py` (`Application` и `Controllers`).
+6. Тесты: unit сервиса на `MagicMock(spec=UnitOfWork)`, unit декоратора на `Mock(interfaces.X)`,
+   HTTP-тест контроллера на `Mock(interfaces.X)`, интеграционный тест репозитория/UoW при новой
+   работе с БД (данные — в `test_data.py`); стиль — как в hex_arch: класс на метод,
+   `# Setup / # Call / # Assert`.
+7. Сборка: новый сервис — в `launchers/api.py` (`Application`, `Decorators` и `Controllers`).
 
 ---
 
@@ -375,13 +463,13 @@ ASCII), поэтому вход, который БД не вместит, отк
 | `unit/application/services/` | сервисы на моках портов: фабрика — `Mock(return_value=uow)`, `MagicMock(spec=interfaces.UnitOfWork)` с `Mock(interfaces.XRepo)`, порядок вызовов через `uow.mock_calls` (commit только у записей, новый UoW на вызов); классы по методам (`TestAdd`, `TestGet`, `TestPlace` …), параметризация «что вернул репозиторий → что отдал сервис» | нет |
 | `unit/application/` | сущности (`test_entities.py`: State, Strategy, остатки), DTO (`test_dtos.py`: нормализация и границы) | нет |
 | `unit/adapters/api/v1/` | `test_schemas.py` — граничные входы `*Body` принимаются DTO ядра (общие типы `dtos.base`) | нет |
-| `unit/adapters/api/` | `test_request_id.py` — `RequestIdMiddleware` на ASGI-заглушке: uuid4, валидный и невалидный заголовок, сброс contextvar (и при исключении), passthrough `lifespan` | нет |
-| `unit/adapters/log/` | `test_settings.py` (регистр уровня, отказ `TRACE`), `test_config.py` (уровни → `propagate`-логгеры, выбор форматтера), `test_context.py` (`RequestIdFilter`) | нет |
+| `unit/adapters/log/` | `test_settings.py` (регистр уровня, отказ `TRACE`), `test_context.py` (`LogContextFilter`: request id, `trace_id` на локальном `TracerProvider`) | нет |
+| `unit/adapters/tracing/` | `test_settings.py` (дефолты, неизвестный экспортёр, границы доли сэмплирования, поля ресурса), `test_config.py` (через `configure`, по возвращённому провайдеру: процессор и экспортёр по режиму, сэмплер `ParentBased` с долей, нулевая доля — спан не записан при валидном `trace_id`, ресурс с версией, окружением и экземпляром), `test_span.py` (политика исхода: успех, `StorageUnavailable` с причиной и без, ошибка ядра → `error.code`, прочее → ERROR, отмена без статуса), `test_unit_of_work.py` (`TracedUnitOfWork` над `MagicMock(spec=UnitOfWork)`: делегирование, `outcome`, исключение тела, замена на `StorageUnavailable`, сбой входа/выхода внутреннего, вложенный вход не ломает внешний, повторное использование), `test_services.py` (`Traced*` над `Mock(interfaces.X)`: аргументы и результат насквозь, имена спанов, ошибки, родитель) | нет |
 | `unit/adapters/database/` | `test_database.py` — `logger_levels` по `POSTGRES_ECHO_SQL` | нет |
-| `integration/adapters/log/` | `test_configure.py` — `configure` в дочернем процессе: text и json, ранний логгер пишет, `uvicorn.access` в нашем формате с `request_id`, WARNING режет SQL | нет |
-| `unit/launchers/` | `test_api.py` — composition root импортируется с подставленными `POSTGRES_*`, `Adapters.uow_factory()` собирает `database.UnitOfWork`, сервисы делят одну фабрику; запросов к БД нет | нет |
-| `integration/adapters/api/controllers/` | настоящий FastAPI над `Mock(services.X)` (`conftest.py`: `<x>_service`, `app`, `client`); модуль на ресурс, класс на обработчик (`TestCreateCustomer`, `TestListOrders` …); `test_error_handlers.py` — 503 с `Retry-After`, 500 без подробностей, единое тело 404/405, контракт OpenAPI; `test_request_id.py` — `X-Request-ID` возвращается на 200, 404, 503 и 500 | нет |
-| `integration/adapters/database/` | `conftest.py` — `create_test_db` (схема через `metadata.create_all`, без миграций), `session` (откат после теста), `uow_factory`; `test_data.py` — наборы `*_DATA` и `insert_*`; `repositories/test_*.py` — `fill_db` autouse, класс на метод репозитория (`TestFetchById`, `TestFetchAll`, `TestAdd` …); `test_unit_of_work.py` — транзакции коммитятся по-настоящему: атомарность, откат на второй строке, оплата и отмена, `FOR UPDATE` (гонка, актуальность, повторная блокировка), дедлок и обрыв соединения (в теле и на commit) → `StorageUnavailable`, жизненный цикл UoW (вне контекста непригоден, вложенный вход запрещён, повторный вход — новая сессия) | `TEST_POSTGRES_*` (на dev-стенде — контейнер `db_for_tests`), иначе `skip`; схема пересоздаётся на каждый тест |
+| `integration/adapters/log/` | `test_configure.py` — `configure` в дочернем процессе: text и json, ранний логгер пишет, `uvicorn.access` в нашем формате с `trace_id` спана, вне спана `-`, WARNING режет SQL | нет |
+| `unit/launchers/` | `test_api.py` — composition root импортируется с подставленными `POSTGRES_*`, `Adapters.uow_factory()` даёт `TracedUnitOfWork` над `database.UnitOfWork`, движок с `TracedPool`, сервисы делят одну фабрику, контроллер получает `Decorators.*`; запросов к БД нет | нет |
+| `integration/adapters/api/controllers/` | настоящий FastAPI над `Mock(interfaces.X)` (`conftest.py`: `<x>_service`, `app`, `client`); модуль на ресурс, класс на обработчик (`TestCreateCustomer`, `TestListOrders` …); `test_error_handlers.py` — 503 с `Retry-After`, 500 без подробностей, единое тело 404/405, контракт OpenAPI; `test_tracing.py` — серверный спан по маршруту, `traceparent` продолжен, `healthcheck` вне трассы (и под `root_path`), 500 → ERROR, спан сценария `Order.get` под серверным с `error.code` на 404, запись лога обработчика с `trace_id` из `traceparent` клиента | нет |
+| `integration/adapters/database/` | `conftest.py` — `create_test_db` (схема через `metadata.create_all`, без миграций, `NullPool`), `session` (откат после теста), `uow_factory` (чистый UoW), `traced_uow_factory` (под декоратором), `traced_pool_engine` (`TracedPool` на один слот); `test_data.py` — наборы `*_DATA` и `insert_*`; `repositories/test_*.py` — `fill_db` autouse, класс на метод репозитория (`TestFetchById`, `TestFetchAll`, `TestAdd` …); `test_unit_of_work.py` — транзакции коммитятся по-настоящему: атомарность, откат на второй строке, оплата и отмена, `FOR UPDATE` (гонка, актуальность, повторная блокировка), дедлок и обрыв соединения (в теле и на commit) → `StorageUnavailable`, жизненный цикл UoW (вне контекста непригоден, вложенный вход запрещён, повторный вход — новая сессия), исход транзакции и ошибки в спане `unit_of_work` декоратора, вложенный вход не ломает внешний; `test_spans.py` — спаны SQL как дети `unit_of_work`, ошибка SQL → статус ERROR, `pool.connect` до первого SELECT с состоянием пула, ожидание занятого слота видно в спане, дерево `Product.get → unit_of_work → SELECT` на настоящем сервисе | `TEST_POSTGRES_*` (на dev-стенде — контейнер `db_for_tests`), иначе `skip`; схема пересоздаётся на каждый тест |
 
 Соглашения (как в hex_arch): секции `# SETUP` / `# TESTS` в модуле, фикстуры с явным `scope`
 рядом с тестами, имена `test__<метод>` и `test__<ошибка>`, комментарии `# Setup`, `# Call`,
@@ -390,7 +478,8 @@ ASCII), поэтому вход, который БД не вместит, отк
 
 Особенности моков: у `MagicMock(spec=UnitOfWork)` нужно явно задать
 `__aenter__.return_value = uow` и присвоить репозитории (spec не протаскивается в свойства);
-сервисы мокаются `Mock(services.X)`, фабрика UoW — `Mock(return_value=uow)`.
+сценарии мокаются по входящим портам — `Mock(interfaces.X)` (абстрактные `async`-методы дают
+`AsyncMock`), фабрика UoW — `Mock(return_value=uow)`.
 
 ---
 
@@ -401,7 +490,10 @@ ASCII), поэтому вход, который БД не вместит, отк
 | Falcon + gunicorn/gevent, sync SQLAlchemy | FastAPI + uvicorn, async SQLAlchemy (asyncpg) | async-стек; HTTP-адаптер по образцу interactive_panels |
 | `TransactionContext` (сессия на поток, счётчик вложенности) + реестр `DecoratedFunctionRegistry.apply_decorators(...)` в launcher | вызываемая фабрика UoW в конструкторе сервиса + явный `async with self.uow_factory() as uow` в методе | thread-local не живёт в asyncio; без глобальной мутации классов; UoW и репозитории создаются на вызов |
 | Репозитории — синглтоны с сессией из контекста | Репозитории создаёт `UnitOfWork.__aenter__` на каждую транзакцию | то же |
-| `adapters/log` + фрагменты `LOGGING_CONFIG` в `Settings` каждого адаптера с привязкой к хендлеру `default` | `adapters/log` + `database.logger_levels` и `UVICORN_LOGGERS` в launcher: только имя логгера → уровень, `propagate` в корень; `request_id` через contextvar и фильтр | без связности по имени хендлера и строителя в Settings; `disable_existing_loggers=False`; имена логгеров — `__name__`; корреляция запросов |
+| `adapters/log` + фрагменты `LOGGING_CONFIG` в `Settings` каждого адаптера с привязкой к хендлеру `default` | `adapters/log` + `database.logger_levels` и `UVICORN_LOGGERS` в launcher: только имя логгера → уровень, `propagate` в корень; `trace_id` спана через фильтр | без связности по имени хендлера и строителя в Settings; `disable_existing_loggers=False`; имена логгеров — `__name__`; корреляция запросов — трассой, без отдельного request id |
+| Трассировки нет | OpenTelemetry: встроенная телеметрия FastAPI, декораторы над портами (сценарии, единица работы), `TracedPool`, слушатели SQLAlchemy, `trace_id` в логах | наблюдаемость запроса сквозь слои без правок ядра и адаптера БД |
+| Входящих портов нет: контроллер зависит от конкретных сервисов | Входящие порты `interfaces.Customer/Product/Order`: контроллер и декораторы зависят от них | GoF Decorator над сценарием требует абстракции (DIP, OCP); у hex_arch ту же роль играет реестр декораторов, мутирующий классы |
+
 | `application/schemas` для параметров поиска | `FindOrders` в `dtos/order.py` | слово `schemas` занято HTTP-швом с другим смыслом |
 | Pydantic v1, `validate_arguments` на методах сервисов | Pydantic v2, без `validate_call` | вход валидируется при построении DTO на границе |
 | `ErrorMeta` (метакласс) | `__init_subclass__` + категории ошибок | меньше магии; категории дают OCP в обработчике ошибок |
@@ -416,5 +508,4 @@ ASCII), поэтому вход, который БД не вместит, отк
 ## Что сознательно не сделано
 
 Аутентификация, брокеры сообщений, CI, фронтенд и CORS, TLS и prod-hardening, i18n, UoW-порты по агрегатам, вложенные транзакции — всё это
-вне учебного минимума. `docs/plan.md` после реализации остаётся историей проектирования;
-действующие правила — в этом README и в докстрингах.
+вне учебного минимума. Действующие правила — в этом README и в докстрингах.

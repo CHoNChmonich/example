@@ -1,26 +1,24 @@
 """Сборка приложения FastAPI из готового контроллера."""
 
+from collections.abc import MutableMapping
 from typing import Any
 
 from fastapi import FastAPI
-from starlette.types import ASGIApp
+from fastapi.telemetry import TelemetryConfig
 
 from . import error_handlers
 from .lifespan import Lifespan
-from .request_id import RequestIdMiddleware
+from .v1 import HEALTHCHECK_PATH
 from .v1 import Controller as V1Controller
 from .v1 import create_router as create_v1_router
 
 
 class App(FastAPI):
-    """FastAPI с двумя отличиями проекта: без 422 в схеме и с request id снаружи стека.
+    """FastAPI с одним отличием проекта: без 422 в схеме.
 
     FastAPI дописывает 422 каждой ручке с валидацией, но ошибки разбора запроса адаптер
     отдаёт как 400 (он уже объявлен в картах ответов роутера), поэтому 422 и его модели
     из схемы убираются; ``super().openapi()`` кэширует схему, правка в ней сохраняется.
-    ``RequestIdMiddleware`` оборачивает весь стек Starlette, а не добавляется через
-    ``add_middleware``: иначе он оказался бы внутри ``ServerErrorMiddleware``, и ответ 500
-    уходил бы без ``X-Request-ID``.
     """
 
     def openapi(self) -> dict[str, Any]:
@@ -37,14 +35,6 @@ class App(FastAPI):
             schema.get("components", {}).get("schemas", {}).pop(model, None)
         return schema
 
-    def build_middleware_stack(self) -> ASGIApp:
-        """Собирает стек middleware и оборачивает его корреляцией запросов снаружи.
-
-        Returns:
-            ASGI-приложение: ``RequestIdMiddleware`` поверх стандартного стека.
-        """
-        return RequestIdMiddleware(super().build_middleware_stack())
-
 
 def create_app(
     *,
@@ -52,7 +42,16 @@ def create_app(
     v1_prefix: str = "/api/v1",
     lifespan: Lifespan | None = None,
 ) -> FastAPI:
-    """Собирает приложение: маршруты v1, обработчики ошибок, lifespan.
+    """Собирает приложение: маршруты v1, обработчики ошибок, lifespan, телеметрию.
+
+    Трассировка — встроенная телеметрия FastAPI: серверный спан на запрос с именем по
+    маршруту, продолжение входящего ``traceparent``, статус ERROR при необработанном
+    исключении. Спан открывает ``FastAPI.__call__`` до входа в стек middleware, поэтому
+    ``trace_id`` есть в каждой строке лога запроса, включая access-лог uvicorn; отдельного
+    идентификатора запроса нет — корреляция клиента с сервером идёт через ``traceparent``.
+    Служебные спаны операций, метрики, логи и автоконфигурация из ``OTEL_*`` выключены явно:
+    экспорт задаёт только ``adapters.tracing``. ``healthcheck`` из трассы исключён по пути с
+    учётом ``root_path``. Без глобального провайдера телеметрия неактивна.
 
     CORS не настраивается: у сервиса нет браузерного фронтенда.
 
@@ -64,10 +63,20 @@ def create_app(
     Returns:
         Готовое к запуску приложение FastAPI.
     """
+    healthcheck_path = f"{v1_prefix}{HEALTHCHECK_PATH}"
+    telemetry: TelemetryConfig = {
+        "tracing": True,
+        "operation_spans": False,
+        "metrics": False,
+        "logs": False,
+        "auto_configure": False,
+        "exclude": lambda scope: _path_without_root(scope) == healthcheck_path,
+    }
     app = App(
         title="Orders Service API",
         version="1.0.0",
         lifespan=lifespan,
+        telemetry=telemetry,
         openapi_tags=[
             {"name": "v1: Customers"},
             {"name": "v1: Products"},
@@ -77,3 +86,16 @@ def create_app(
     error_handlers.register_error_handlers(app)
     app.include_router(create_v1_router(v1_controller, prefix=v1_prefix))
     return app
+
+
+def _path_without_root(scope: MutableMapping[str, Any]) -> str:
+    """Возвращает путь запроса без ``root_path``: по спецификации ASGI ``path`` его включает.
+
+    Args:
+        scope: ASGI scope HTTP-запроса.
+
+    Returns:
+        Путь относительно точки монтирования приложения.
+    """
+    path = str(scope.get("path", ""))
+    return path.removeprefix(str(scope.get("root_path", "")).rstrip("/"))
