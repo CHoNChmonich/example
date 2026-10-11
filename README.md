@@ -10,16 +10,13 @@ uv, docker compose. Код, комментарии и документация �
 проверяет ruff `D`); пояснения к коду живут в докстрингах, а не в комментариях внутри функций
 и классов.
 
-Образцы, по которым построен проект: слои и правила слоёв — учебный репозиторий `hex_arch`;
-устройство HTTP-адаптера и composition root — сервис `interactive_panels`. Действующие
-правила — этот README и докстринги.
+Действующие правила — этот README и докстринги.
 
 ---
 
 ## Быстрый старт
 
-Деплой устроен по образцу `hex_arch/deployment`: всё, что относится к Docker, лежит в
-`deployment/` — `dockerfiles/Dockerfile` (стадии `base → dependency-installer → builder →
+Всё, что относится к Docker, лежит в `deployment/` — `dockerfiles/Dockerfile` (стадии `base → dependency-installer → builder →
 tests / development / production`), `docker-composes/dev/docker-compose.dev.yml` и
 `docker-composes/prod/docker-compose.prod.yml`, `entrypoints/` (скрипты запуска контейнеров),
 `manage/` (скрипты управления стендом), `nginx_config/`.
@@ -447,7 +444,7 @@ ASCII), поэтому вход, который БД не вместит, отк
    `add_api_route` в `router.py` с `operation_id`, тегом и картой ответов.
 6. Тесты: unit сервиса на `MagicMock(spec=UnitOfWork)`, unit декоратора на `Mock(interfaces.X)`,
    HTTP-тест контроллера на `Mock(interfaces.X)`, интеграционный тест репозитория/UoW при новой
-   работе с БД (данные — в `test_data.py`); стиль — как в hex_arch: класс на метод,
+   работе с БД (данные — в `test_data.py`); стиль: класс на метод,
    `# Setup / # Call / # Assert`.
 7. Сборка: новый сервис — в `launchers/api.py` (`Application`, `Decorators` и `Controllers`).
 
@@ -455,8 +452,8 @@ ASCII), поэтому вход, который БД не вместит, отк
 
 ## Тесты
 
-Раскладка повторяет образец `hex_arch` (`tests/med_sharing_system/...`): `tests/orders_service/`
-зеркалит слои пакета, каждый каталог — пакет с `__init__.py`.
+Раскладка: `tests/orders_service/` зеркалит слои пакета, каждый каталог — пакет с
+`__init__.py`.
 
 | Каталог | Что проверяет | Инфраструктура |
 |---|---|---|
@@ -471,10 +468,9 @@ ASCII), поэтому вход, который БД не вместит, отк
 | `integration/adapters/api/controllers/` | настоящий FastAPI над `Mock(interfaces.X)` (`conftest.py`: `<x>_service`, `app`, `client`); модуль на ресурс, класс на обработчик (`TestCreateCustomer`, `TestListOrders` …); `test_error_handlers.py` — 503 с `Retry-After`, 500 без подробностей, единое тело 404/405, контракт OpenAPI; `test_tracing.py` — серверный спан по маршруту, `traceparent` продолжен, `healthcheck` вне трассы (и под `root_path`), 500 → ERROR, спан сценария `Order.get` под серверным с `error.code` на 404, запись лога обработчика с `trace_id` из `traceparent` клиента | нет |
 | `integration/adapters/database/` | `conftest.py` — `create_test_db` (схема через `metadata.create_all`, без миграций, `NullPool`), `session` (откат после теста), `uow_factory` (чистый UoW), `traced_uow_factory` (под декоратором), `traced_pool_engine` (`TracedPool` на один слот); `test_data.py` — наборы `*_DATA` и `insert_*`; `repositories/test_*.py` — `fill_db` autouse, класс на метод репозитория (`TestFetchById`, `TestFetchAll`, `TestAdd` …); `test_unit_of_work.py` — транзакции коммитятся по-настоящему: атомарность, откат на второй строке, оплата и отмена, `FOR UPDATE` (гонка, актуальность, повторная блокировка), дедлок и обрыв соединения (в теле и на commit) → `StorageUnavailable`, жизненный цикл UoW (вне контекста непригоден, вложенный вход запрещён, повторный вход — новая сессия), исход транзакции и ошибки в спане `unit_of_work` декоратора, вложенный вход не ломает внешний; `test_spans.py` — спаны SQL как дети `unit_of_work`, ошибка SQL → статус ERROR, `pool.connect` до первого SELECT с состоянием пула, ожидание занятого слота видно в спане, дерево `Product.get → unit_of_work → SELECT` на настоящем сервисе | `TEST_POSTGRES_*` (на dev-стенде — контейнер `db_for_tests`), иначе `skip`; схема пересоздаётся на каждый тест |
 
-Соглашения (как в hex_arch): секции `# SETUP` / `# TESTS` в модуле, фикстуры с явным `scope`
-рядом с тестами, имена `test__<метод>` и `test__<ошибка>`, комментарии `# Setup`, `# Call`,
-`# Assert`, проверки через `method_calls`. Единственное отличие от образца — полные аннотации
-типов: тесты проверяются ruff (`ANN`) и mypy strict.
+Соглашения: секции `# SETUP` / `# TESTS` в модуле, фикстуры с явным `scope` рядом с тестами,
+имена `test__<метод>` и `test__<ошибка>`, комментарии `# Setup`, `# Call`, `# Assert`, проверки
+через `method_calls`, полные аннотации типов: тесты проверяются ruff (`ANN`) и mypy strict.
 
 Особенности моков: у `MagicMock(spec=UnitOfWork)` нужно явно задать
 `__aenter__.return_value = uow` и присвоить репозитории (spec не протаскивается в свойства);
@@ -483,25 +479,24 @@ ASCII), поэтому вход, который БД не вместит, отк
 
 ---
 
-## Отличия от hex_arch (глоссарий)
+## Принятые решения (глоссарий)
 
-| hex_arch | Здесь | Почему |
-|---|---|---|
-| Falcon + gunicorn/gevent, sync SQLAlchemy | FastAPI + uvicorn, async SQLAlchemy (asyncpg) | async-стек; HTTP-адаптер по образцу interactive_panels |
-| `TransactionContext` (сессия на поток, счётчик вложенности) + реестр `DecoratedFunctionRegistry.apply_decorators(...)` в launcher | вызываемая фабрика UoW в конструкторе сервиса + явный `async with self.uow_factory() as uow` в методе | thread-local не живёт в asyncio; без глобальной мутации классов; UoW и репозитории создаются на вызов |
-| Репозитории — синглтоны с сессией из контекста | Репозитории создаёт `UnitOfWork.__aenter__` на каждую транзакцию | то же |
-| `adapters/log` + фрагменты `LOGGING_CONFIG` в `Settings` каждого адаптера с привязкой к хендлеру `default` | `adapters/log` + `database.logger_levels` и `UVICORN_LOGGERS` в launcher: только имя логгера → уровень, `propagate` в корень; `trace_id` спана через фильтр | без связности по имени хендлера и строителя в Settings; `disable_existing_loggers=False`; имена логгеров — `__name__`; корреляция запросов — трассой, без отдельного request id |
-| Трассировки нет | OpenTelemetry: встроенная телеметрия FastAPI, декораторы над портами (сценарии, единица работы), `TracedPool`, слушатели SQLAlchemy, `trace_id` в логах | наблюдаемость запроса сквозь слои без правок ядра и адаптера БД |
-| Входящих портов нет: контроллер зависит от конкретных сервисов | Входящие порты `interfaces.Customer/Product/Order`: контроллер и декораторы зависят от них | GoF Decorator над сценарием требует абстракции (DIP, OCP); у hex_arch ту же роль играет реестр декораторов, мутирующий классы |
-
-| `application/schemas` для параметров поиска | `FindOrders` в `dtos/order.py` | слово `schemas` занято HTTP-швом с другим смыслом |
-| Pydantic v1, `validate_arguments` на методах сервисов | Pydantic v2, без `validate_call` | вход валидируется при построении DTO на границе |
-| `ErrorMeta` (метакласс) | `__init_subclass__` + категории ошибок | меньше магии; категории дают OCP в обработчике ошибок |
-| Стратегия поиска `_XStrategySelector` → 2ⁿ методов репозитория | `OrdersRepo.fetch_all(FindOrders)` с динамическим `WHERE` | Strategy показана на скидке |
-| `deployment/backend/` в монорепозитории, `.env` в `components/backend/` | `deployment/` и `.env` в корне | один компонент — плоская раскладка; состав тот же: Dockerfile со стадиями (`dockerfiles/`), compose dev/prod (`docker-composes/`), `entrypoints/`, `manage/`, `nginx_config/`; подготовленных данных (`test_data.py`) нет |
-| `db` доступна только внутри сети compose | в dev `db` и `db_for_tests` публикуются на `POSTGRES_PORT` / `TEST_POSTGRES_PORT` | локальные `uv run uvicorn --reload` и `pytest` без второго Postgres; в prod — как в образце |
-| `where(entities.X.attr == …)` в запросах | `where(tables.x.c.col == …)` | под `mypy --strict` атрибуты dataclass-сущностей не `InstrumentedAttribute`; выборка всё равно возвращает сущности |
-| Без линтера | ruff + mypy strict | strict-типизация портов и тестов — часть демонстрации |
+| Решение | Почему |
+|---|---|
+| FastAPI + uvicorn, async SQLAlchemy (asyncpg) | async-стек целиком, без смешения sync и async |
+| Вызываемая фабрика UoW в конструкторе сервиса + явный `async with self.uow_factory() as uow` в методе | thread-local сессия не живёт в asyncio; без глобальной мутации классов декораторами-реестрами; UoW и репозитории создаются на вызов |
+| Репозитории создаёт `UnitOfWork.__aenter__` на каждую транзакцию | то же: синглтон-репозиторий с сессией из контекста несовместим с конкурентными запросами |
+| `adapters/log` + `database.logger_levels` и `UVICORN_LOGGERS` в launcher: только имя логгера → уровень, `propagate` в корень; `trace_id` спана через фильтр | без связности по имени хендлера в настройках адаптеров; `disable_existing_loggers=False`; имена логгеров — `__name__`; корреляция запросов — трассой, без отдельного request id |
+| OpenTelemetry: встроенная телеметрия FastAPI, декораторы над портами (сценарии, единица работы), `TracedPool`, слушатели SQLAlchemy, `trace_id` в логах | наблюдаемость запроса сквозь слои без правок ядра и адаптера БД |
+| Входящие порты `interfaces.Customer/Product/Order`: контроллер и декораторы зависят от них, а не от `services.X` | GoF Decorator над сценарием требует абстракции (DIP, OCP) |
+| `FindOrders` в `dtos/order.py`, а не в отдельном `schemas` | слово `schemas` занято HTTP-швом с другим смыслом |
+| Pydantic v2, без `validate_call` на методах сервисов | вход валидируется при построении DTO на границе |
+| `__init_subclass__` + категории ошибок вместо метакласса | меньше магии; категории дают OCP в обработчике ошибок |
+| `OrdersRepo.fetch_all(FindOrders)` с динамическим `WHERE` вместо метода на каждую комбинацию фильтров | один метод вместо 2ⁿ; Strategy показана на скидке |
+| `deployment/` и `.env` в корне | один компонент — плоская раскладка: Dockerfile со стадиями (`dockerfiles/`), compose dev/prod (`docker-composes/`), `entrypoints/`, `manage/`, `nginx_config/` |
+| В dev `db` и `db_for_tests` публикуются на `POSTGRES_PORT` / `TEST_POSTGRES_PORT`, в prod — только внутри сети compose | локальные `uv run uvicorn --reload` и `pytest` без второго Postgres |
+| `where(tables.x.c.col == …)` в запросах, а не атрибуты сущностей | под `mypy --strict` атрибуты dataclass-сущностей не `InstrumentedAttribute`; выборка всё равно возвращает сущности |
+| ruff + mypy strict, включая тесты | strict-типизация портов и тестов — часть демонстрации |
 
 ---
 

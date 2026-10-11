@@ -60,7 +60,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# В тестах стиль hex_arch: классы и функции без докстрингов, комментарии Setup/Call/Assert.
+# В тестах докстринги не требуются: классы на метод, комментарии Setup/Call/Assert.
 "tests/**/*.py" = ["S101", "D"]
 
 [tool.ruff.lint.pydocstyle]
