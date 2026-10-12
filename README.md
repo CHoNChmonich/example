@@ -172,8 +172,8 @@ sequenceDiagram
     S->>U: products.fetch_by_ids(for_update=True) — SELECT … FOR UPDATE
     S->>E: product.reserve(qty) · Order(...) · order.apply_discount(policy)
     S->>U: orders.add(order) → flush
-    S->>W: commit() → U.commit(); outcome = committed
-    S->>W: __aexit__ → U.__aexit__ (rollback холостой, close); спан закрыт
+    S->>W: commit() → U.commit()#59; outcome = committed
+    S->>W: __aexit__ → U.__aexit__ (rollback холостой, close)#59; спан закрыт
     S-->>R: dtos.Order (собран внутри контекста)
     R-->>C: 201 OrderResponse
 ```
